@@ -1,0 +1,14 @@
+.env
+.env.*
+
+__pycache__/
+*.py[cod]
+
+agent_data/
+backend.log
+frontend.log
+backend.pid
+frontend.pid
+
+frontend/node_modules/
+.idea/
