@@ -646,6 +646,19 @@ body {
   border: 1px solid var(--glass-border);
 }
 
+.bubble.is-thinking {
+  color: #475569;
+  border-color: rgba(99, 102, 241, 0.25);
+  background: linear-gradient(120deg, #f8fafc, #eef2ff, #f8fafc);
+  background-size: 220% 100%;
+  animation: thinkingFlow 1.8s linear infinite;
+}
+
+@keyframes thinkingFlow {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
 .bubble p { margin: 0 0 10px 0; }
 .bubble p:last-child { margin-bottom: 0; }
 .bubble pre { background: #f8fafc; padding: 12px; border-radius: 10px; overflow-x: auto; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; margin: 12px 0; border: 1px solid #e2e8f0; }

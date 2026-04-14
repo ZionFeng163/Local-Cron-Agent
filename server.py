@@ -18,7 +18,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from exquisite_agent.agents.react_fc import FCAgent
 from exquisite_agent.llm import LLM
 
 from tools.sandbox_bash_executor import SandboxBashExecutor
@@ -31,6 +30,7 @@ from exquisite_agent.tools.searchtool import SearchTool
 
 from task_manager import TaskManager
 from langgraph_orchestrator import LangGraphOrchestrator
+from streaming_fc_agent import StreamingFCAgent
 
 # 日志输出配置
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s', datefmt='%H:%M:%S')
@@ -104,7 +104,7 @@ async def lifespan(app: FastAPI):
     file_writer_tool = SandboxFileWriter()
     search_tool = SearchTool()
 
-    agent = FCAgent(
+    agent = StreamingFCAgent(
         llm=LLM(),
         name="Local-Cron-Agent",
         tools=[bash_tool, cron_tool, sys_tool, svc_tool, sched_tool, file_writer_tool, search_tool]
@@ -380,11 +380,20 @@ async def websocket_endpoint(websocket: WebSocket):
             thread.start()
 
             await websocket.send_json({"type": "stream_start"})
+            last_heartbeat_ts = asyncio.get_running_loop().time()
 
             while True:
-                item = await asyncio.to_thread(q.get)
+                try:
+                    item = await asyncio.to_thread(q.get, True, 1.0)
+                except queue.Empty:
+                    now = asyncio.get_running_loop().time()
+                    if now - last_heartbeat_ts >= 3:
+                        await websocket.send_json({"type": "heartbeat", "content": "⏳ 正在处理中，请稍候..."})
+                        last_heartbeat_ts = now
+                    continue
                 if item is None:
                     break
+                last_heartbeat_ts = asyncio.get_running_loop().time()
                 if item.get("type") == "tool_ended":
                     # 工具执行完毕后同步 DB 并通知前端
                     task_mgr.sync_internal_tasks()

@@ -44,7 +44,7 @@ watch(() => props.messages, () => {
     </div>
     <div class="messages" ref="msgContainer">
       <div v-for="(msg, i) in messages" :key="i" :class="['message', msg.role]">
-        <div class="bubble" v-html="renderMarkdown(msg.content)"></div>
+        <div :class="['bubble', { 'is-thinking': !!msg.isThinking }]" v-html="renderMarkdown(msg.content)"></div>
       </div>
     </div>
     <div class="input-area">

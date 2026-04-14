@@ -43,6 +43,83 @@ const chatMessages = ref([
   { role: 'agent', content: '您好，长官！我是您的 Local-Cron-Agent。很高兴为您服务。通过在下面打字，您可以让我暂停/拉起任何定时任务，或清理宿主机。' }
 ])
 
+const thinkingHints = [
+  '正在理解你的需求...',
+  '正在规划执行步骤...',
+  '正在调用工具检查环境...',
+  '正在整理执行结果...',
+  '正在生成最终回复...'
+]
+
+let thinkingTimer = null
+let thinkingHintIdx = 0
+let receivedAgentContent = false
+let lastProgressAt = 0
+
+const getLastMessage = () => chatMessages.value[chatMessages.value.length - 1]
+
+const ensureThinkingMessage = () => {
+  const last = getLastMessage()
+  if (last && last.role === 'agent' && last.isThinking) return last
+  const thinkingMsg = { role: 'agent', isThinking: true, content: thinkingHints[0] }
+  chatMessages.value.push(thinkingMsg)
+  return thinkingMsg
+}
+
+const startThinkingHints = () => {
+  stopThinkingHints()
+  thinkingHintIdx = 0
+  lastProgressAt = Date.now()
+  const msg = ensureThinkingMessage()
+  msg.content = thinkingHints[thinkingHintIdx]
+  thinkingTimer = setInterval(() => {
+    const last = getLastMessage()
+    if (!last || !last.isThinking) return
+    if (Date.now() - lastProgressAt < 2400) return
+    thinkingHintIdx = (thinkingHintIdx + 1) % thinkingHints.length
+    last.content = thinkingHints[thinkingHintIdx]
+  }, 2200)
+}
+
+const stopThinkingHints = () => {
+  if (thinkingTimer) {
+    clearInterval(thinkingTimer)
+    thinkingTimer = null
+  }
+}
+
+const appendAgentContent = (content) => {
+  if (!content) return
+  let last = getLastMessage()
+  if (!last || last.role !== 'agent') {
+    chatMessages.value.push({ role: 'agent', content: '' })
+    last = getLastMessage()
+  }
+  if (last.isThinking) {
+    last.isThinking = false
+    last.content = ''
+  }
+  last.content += content
+  receivedAgentContent = true
+}
+
+const updateThinkingStatus = (text) => {
+  if (!text || receivedAgentContent) return
+  const msg = ensureThinkingMessage()
+  msg.content = text
+  lastProgressAt = Date.now()
+}
+
+const finalizeThinkingMessage = () => {
+  const last = getLastMessage()
+  if (last && last.role === 'agent' && last.isThinking) {
+    last.isThinking = false
+    if (!receivedAgentContent) {
+      last.content = '✅ 指令已执行完成。'
+    }
+  }
+}
+
 const navigateTo = (view) => {
   currentView.value = view
 }
@@ -57,22 +134,31 @@ const initWebSocket = () => {
     if (msg.type === 'refresh_jobs') {
       refreshAll()
     } else if (msg.type === 'stream_start') {
-      if (chatMessages.value.length > 0 && chatMessages.value[chatMessages.value.length-1].isThinking) {
-         chatMessages.value.pop()
-      }
-      chatMessages.value.push({ role: 'agent', content: '' })
-    } else if (msg.type === 'tool_start' || msg.type === 'content_chunk' || msg.type === 'message') {
-      if (msg.type === 'message' && chatMessages.value.length > 0 && chatMessages.value[chatMessages.value.length-1].isThinking) {
-         chatMessages.value.pop()
-         chatMessages.value.push({ role: 'agent', content: '' })
-      }
-      const lastMsg = chatMessages.value[chatMessages.value.length - 1]
-      if (lastMsg && lastMsg.role === 'agent') {
-         lastMsg.content += (msg.content || '')
+      receivedAgentContent = false
+      startThinkingHints()
+    } else if (msg.type === 'stream_end') {
+      stopThinkingHints()
+      finalizeThinkingMessage()
+    } else if (msg.type === 'tool_start') {
+      updateThinkingStatus(msg.content || '正在调用工具执行任务...')
+    } else if (msg.type === 'status' || msg.type === 'heartbeat' || msg.type === 'tool_result') {
+      updateThinkingStatus(msg.content || '处理中...')
+    } else if (msg.type === 'content_chunk' || msg.type === 'message') {
+      const content = msg.content || ''
+      if (content.trim()) {
+        appendAgentContent(content)
+      } else if (!receivedAgentContent) {
+        ensureThinkingMessage()
       }
     }
   }
   ws.onclose = () => {
+    stopThinkingHints()
+    const last = getLastMessage()
+    if (last && last.isThinking) {
+      last.isThinking = false
+      last.content = '❌ 与后端连接断开，请稍后重试。'
+    }
     setTimeout(initWebSocket, 3000)
   }
 }
@@ -80,12 +166,18 @@ const initWebSocket = () => {
 const sendMessage = (text) => {
   if (!text) return
   chatMessages.value.push({ role: 'user', content: text })
-  chatMessages.value.push({ role: 'agent', isThinking: true, content: '🧠 正在推演行动策略，请稍候...' })
+  receivedAgentContent = false
+  chatMessages.value.push({ role: 'agent', isThinking: true, content: thinkingHints[0] })
+  startThinkingHints()
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(text)
   } else {
-    chatMessages.value.pop()
-    chatMessages.value.push({ role: 'agent', content: '❌ 无法连接到后端，请确保 Uvicorn 正在运行。' })
+    stopThinkingHints()
+    const last = getLastMessage()
+    if (last && last.isThinking) {
+      last.isThinking = false
+      last.content = '❌ 无法连接到后端，请确保 Uvicorn 正在运行。'
+    }
   }
 }
 
@@ -114,6 +206,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   if (refreshTimer) clearInterval(refreshTimer)
+  stopThinkingHints()
 })
 </script>
 
