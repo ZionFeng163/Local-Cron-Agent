@@ -8,6 +8,7 @@ import LogViewer from './components/LogViewer.vue'
 import ChatView from './components/ChatView.vue'
 import SettingsView from './components/SettingsView.vue'
 import SystemHealthView from './components/SystemHealthView.vue'
+import HealCenterView from './components/HealCenterView.vue'
 
 const currentView = ref('dashboard')
 
@@ -230,6 +231,7 @@ onUnmounted(() => {
         @refresh="refreshAll"
         @showDetail="showTaskDetail" />
       <SystemHealthView v-if="currentView === 'health'" />
+      <HealCenterView  v-if="currentView === 'heals'" />
       <ScriptEditor   v-if="currentView === 'scripts'" />
       <LogViewer      v-if="currentView === 'logs'" />
       <ChatView       v-if="currentView === 'chat'" :messages="chatMessages" @send="sendMessage" />

@@ -43,6 +43,16 @@ const metricList = () => {
 
 const boolText = (v) => (v ? '正常' : '异常')
 
+const formatTopProcess = () => {
+  if (!report.value) return '---'
+  const name = report.value.top_process_name || report.value.top_process || ''
+  const cpu = report.value.top_process_cpu_percent
+  if (name && cpu !== null && cpu !== undefined && cpu !== '') {
+    return `${name}（CPU ${Number(cpu).toFixed(1)}%）`
+  }
+  return name || '---'
+}
+
 onMounted(loadLatest)
 </script>
 
@@ -82,7 +92,7 @@ onMounted(loadLatest)
       </div>
 
       <div class="table-section">
-        <h3 class="table-title">指标明细（含是否正常）</h3>
+        <h3 class="table-title">指标明细</h3>
         <table class="data-table">
           <thead>
             <tr>
@@ -115,7 +125,7 @@ onMounted(loadLatest)
       <div class="table-section" v-if="report.top_process">
         <h3 class="table-title">当前高负载进程</h3>
         <div class="section-card">
-          <div class="mono">{{ report.top_process }}</div>
+          <div class="mono">{{ formatTopProcess() }}</div>
         </div>
       </div>
 

@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -97,6 +97,19 @@ top_process = subprocess.run(
     text=True,
 ).stdout.strip()
 
+top_process_name = ""
+top_process_cpu_percent = None
+if top_process:
+    parts = top_process.split()
+    if len(parts) >= 2:
+        top_process_name = parts[0]
+        try:
+            top_process_cpu_percent = float(parts[-1])
+        except Exception:
+            top_process_cpu_percent = None
+    else:
+        top_process_name = top_process
+
 print(json.dumps({
     'disk_root_percent': pct('/'),
     'disk_home_percent': pct('/home/ubuntu'),
@@ -107,6 +120,8 @@ print(json.dumps({
     'cpu_count': cpu_count,
     'cron_active': cron_active,
     'top_process': top_process,
+    'top_process_name': top_process_name,
+    'top_process_cpu_percent': top_process_cpu_percent,
 }, ensure_ascii=False))
 PY
 """
@@ -221,6 +236,8 @@ def run_system_health_check(trigger: str, auto_heal: bool = True) -> Dict[str, A
 
         report["metrics"] = metrics_before
         report["top_process"] = raw_before.get("top_process", "")
+        report["top_process_name"] = raw_before.get("top_process_name", "")
+        report["top_process_cpu_percent"] = raw_before.get("top_process_cpu_percent")
         report["overall_is_normal"] = before_ok
 
         if auto_heal and not before_ok:
@@ -234,6 +251,8 @@ def run_system_health_check(trigger: str, auto_heal: bool = True) -> Dict[str, A
                 report["metrics_before_heal"] = metrics_before
                 report["metrics"] = metrics_after
                 report["top_process"] = raw_after.get("top_process", "")
+                report["top_process_name"] = raw_after.get("top_process_name", "")
+                report["top_process_cpu_percent"] = raw_after.get("top_process_cpu_percent")
                 report["overall_is_normal_before_heal"] = before_ok
                 report["overall_is_normal"] = after_ok
                 report["self_heal"]["summary"] = "修复后已恢复正常" if after_ok else "已尝试修复，但仍有异常"
@@ -250,6 +269,8 @@ def run_system_health_check(trigger: str, auto_heal: bool = True) -> Dict[str, A
     return report
 
 
+
+
 def system_check_job():
     logging.info(">>> 触发定时心跳：执行系统体检与自动异常排查 <<<")
     report = run_system_health_check(trigger="scheduled", auto_heal=True)
@@ -261,7 +282,31 @@ def system_check_job():
         logging.info(f"✨ 定时体检完成: 状态={status} | 自愈={heal}")
 
 
-# ========== WebSocket 消息群发机制 ==========
+def task_monitor_job():
+    """简化任务监测：每分钟主动探测一次运行中的沙盒任务"""
+    if not task_mgr:
+        return
+    try:
+        sandbox_tasks = task_mgr.list_tasks(source="sandbox")
+        for task in sandbox_tasks:
+            if task.status != "running":
+                continue
+            if not getattr(task, "monitor_enabled", 1):
+                continue
+
+            probe = task_mgr.probe_task_once(task.id, reason="scheduled")
+            if not probe:
+                continue
+
+            failures = probe["failures"]
+            if failures >= 3:
+                result = task_mgr.try_heal_task(task.id, reason="auto_threshold")
+                logging.warning(
+                    f"🛠️ 任务自愈触发: {task.name} failures={failures} result={result.get('msg')}"
+                )
+    except Exception as e:
+        logging.error(f"❌ 任务监测异常: {e}")
+
 async def broadcast_refresh_jobs():
     dead_clients = []
     for client in connected_clients:
@@ -282,7 +327,6 @@ async def lifespan(app: FastAPI):
     # 每 3600 秒自动运行内部体检
     scheduler.add_job(system_check_job, 'interval', seconds=3600, id="system_check_job")
     scheduler.start()
-    logging.info("⏳ 后台异步调度器已激活。")
 
     # 初始化 TaskManager 并完成首次同步
     task_mgr = TaskManager(scheduler=scheduler)
@@ -299,6 +343,11 @@ async def lifespan(app: FastAPI):
         task_mgr.sync_internal_tasks()
         task_mgr.sync_sandbox_tasks()
     scheduler.add_job(_periodic_sync, 'interval', seconds=60, id="db_sync_job")
+
+    # 注册任务监测（每 60 秒）
+    scheduler.add_job(task_monitor_job, 'interval', seconds=60, id="task_monitor_job")
+
+    logging.info("⏳ 后台异步调度器已激活。")
 
     # 启动后先做一次健康检查，避免前端首次进入无数据
     def _initial_health_probe():
@@ -374,6 +423,12 @@ def _task_to_dict(t):
         "description": t.description,
         "created_at": t.created_at,
         "updated_at": t.updated_at,
+        "monitor_enabled": bool(getattr(t, "monitor_enabled", 1)),
+        "consecutive_failures": getattr(t, "consecutive_failures", 0),
+        "last_run_at": getattr(t, "last_run_at", ""),
+        "last_success_at": getattr(t, "last_success_at", ""),
+        "last_exit_code": getattr(t, "last_exit_code", None),
+        "last_auto_heal_at": getattr(t, "last_auto_heal_at", ""),
     }
 
 @app.get("/api/jobs")
@@ -449,6 +504,10 @@ class DeleteReq(BaseModel):
     task_id: str = ""
     raw_line: str = ""
 
+
+class TaskHealReq(BaseModel):
+    reason: str = "manual"
+
 @app.post("/api/jobs/delete")
 async def delete_task_api(req: DeleteReq):
     """统一的删除接口"""
@@ -471,7 +530,65 @@ async def delete_ubuntu(req: DeleteReq):
     return {"status": "success"}
 
 
-# ========== 统计 API ==========
+@app.get("/api/tasks/health")
+async def get_tasks_health():
+    tasks = task_mgr.list_tasks(source="sandbox")
+    return {
+        "tasks": [_task_to_dict(t) for t in tasks],
+        "summary": {
+            "total": len(tasks),
+            "failing": sum(1 for t in tasks if getattr(t, "consecutive_failures", 0) > 0),
+            "auto_healed": sum(1 for t in tasks if getattr(t, "last_auto_heal_at", "")),
+        }
+    }
+
+
+@app.get("/api/tasks/{task_id}/runs")
+async def get_task_runs_api(task_id: str, limit: int = 20):
+    safe_limit = max(1, min(limit, 200))
+    runs = task_mgr.get_task_runs(task_id, safe_limit)
+    return {"task_id": task_id, "runs": runs}
+
+
+@app.post("/api/tasks/{task_id}/heal")
+async def heal_task_api(task_id: str, req: TaskHealReq):
+    result = task_mgr.try_heal_task(task_id, reason=req.reason or "manual")
+    task = task_mgr.get_task(task_id)
+    await broadcast_refresh_jobs()
+    return {
+        "status": "success" if result.get("ok") else "error",
+        "result": result,
+        "task": _task_to_dict(task) if task else None,
+    }
+
+
+@app.get("/api/heals/catalog")
+async def get_heal_catalog_api():
+    return task_mgr.get_heal_catalog()
+
+
+@app.get("/api/heals/history")
+async def get_heal_history_api(
+    limit: int = 50,
+    offset: int = 0,
+    task_id: str = "",
+    trigger: str = "",
+    category: str = "",
+    action: str = "",
+    ok: Optional[int] = None,
+):
+    if ok is not None and ok not in (0, 1):
+        raise HTTPException(status_code=400, detail="ok 参数仅支持 0 或 1")
+    return task_mgr.get_heal_records(
+        limit=limit,
+        offset=offset,
+        task_id=task_id,
+        trigger=trigger,
+        category=category,
+        action=action,
+        ok=ok,
+    )
+
 
 @app.get("/api/stats")
 async def get_stats():
