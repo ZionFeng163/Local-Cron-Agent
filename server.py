@@ -1,8 +1,10 @@
 import asyncio
 import logging
 import os
+import json
 import queue
 import threading
+from datetime import datetime
 from dotenv import load_dotenv
 
 # 让本项目自身的 .env 文件优先级最高
@@ -11,7 +13,7 @@ import shlex
 import subprocess
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from typing import List
+from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,17 +45,220 @@ task_mgr: TaskManager = None
 connected_clients: List[WebSocket] = []
 
 
-# ========== 核心后台心跳 ==========
+# ========== 核心后台心跳 + 系统健康自愈 ==========
+health_lock = threading.Lock()
+last_system_health_report: Optional[Dict[str, Any]] = None
+
+
+def _run_in_sandbox(cmd: str, timeout: int = 20) -> subprocess.CompletedProcess:
+    safe_cmd = shlex.quote(cmd)
+    return subprocess.run(
+        f"/usr/local/bin/multipass exec agent-sandbox -- bash -c {safe_cmd}",
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _collect_system_health_raw() -> Dict[str, Any]:
+    probe_script = """
+python3 - <<'PY'
+import json
+import os
+import shutil
+import subprocess
+
+
+def pct(path):
+    total, used, _free = shutil.disk_usage(path)
+    return round((used / total) * 100, 2) if total else 0.0
+
+meminfo = {}
+with open('/proc/meminfo', 'r') as f:
+    for line in f:
+        key, val = line.split(':', 1)
+        meminfo[key] = int(val.strip().split()[0])
+
+mem_total = meminfo.get('MemTotal', 0)
+mem_available = meminfo.get('MemAvailable', 0)
+mem_used_pct = round((1 - (mem_available / mem_total)) * 100, 2) if mem_total else 0.0
+
+load1, load5, load15 = os.getloadavg()
+cpu_count = os.cpu_count() or 1
+cron_active = subprocess.run(
+    'systemctl is-active cron', shell=True, capture_output=True, text=True
+).stdout.strip()
+
+top_process = subprocess.run(
+    "ps -eo comm,%cpu --sort=-%cpu | sed -n '2p'",
+    shell=True,
+    capture_output=True,
+    text=True,
+).stdout.strip()
+
+print(json.dumps({
+    'disk_root_percent': pct('/'),
+    'disk_home_percent': pct('/home/ubuntu'),
+    'memory_used_percent': mem_used_pct,
+    'load_1': round(load1, 2),
+    'load_5': round(load5, 2),
+    'load_15': round(load15, 2),
+    'cpu_count': cpu_count,
+    'cron_active': cron_active,
+    'top_process': top_process,
+}, ensure_ascii=False))
+PY
+"""
+    result = _run_in_sandbox(probe_script, timeout=25)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "系统探针执行失败")
+    out = (result.stdout or "").strip().split("\n")[-1]
+    return json.loads(out)
+
+
+def _metric_payload(label: str, value: Any, threshold: str, is_normal: bool, detail: str) -> Dict[str, Any]:
+    return {
+        "label": label,
+        "value": value,
+        "threshold": threshold,
+        "is_normal": is_normal,
+        "detail": detail,
+    }
+
+
+def _evaluate_health(raw: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    load_threshold = round(max(1.0, raw["cpu_count"] * 1.5), 2)
+
+    metrics = {
+        "disk_root": _metric_payload(
+            "根分区使用率",
+            f"{raw['disk_root_percent']}%",
+            "<= 85%",
+            raw["disk_root_percent"] <= 85,
+            "根分区空间压力",
+        ),
+        "disk_home": _metric_payload(
+            "Home 分区使用率",
+            f"{raw['disk_home_percent']}%",
+            "<= 85%",
+            raw["disk_home_percent"] <= 85,
+            "用户目录空间压力",
+        ),
+        "memory": _metric_payload(
+            "内存使用率",
+            f"{raw['memory_used_percent']}%",
+            "<= 90%",
+            raw["memory_used_percent"] <= 90,
+            "系统内存压力",
+        ),
+        "load": _metric_payload(
+            "系统负载(1m)",
+            raw["load_1"],
+            f"<= {load_threshold}",
+            raw["load_1"] <= load_threshold,
+            "短时负载是否过高",
+        ),
+        "cron_service": _metric_payload(
+            "Cron 服务状态",
+            raw["cron_active"] or "unknown",
+            "active",
+            (raw["cron_active"] == "active"),
+            "定时任务底座服务",
+        ),
+    }
+    return metrics
+
+
+def _attempt_self_heal(raw: Dict[str, Any], metrics: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    actions: List[Dict[str, Any]] = []
+
+    if not metrics["cron_service"]["is_normal"]:
+        result = _run_in_sandbox("sudo systemctl restart cron && systemctl is-active cron", timeout=20)
+        actions.append({
+            "action": "重启 cron 服务",
+            "success": (result.returncode == 0 and "active" in (result.stdout or "")),
+            "stdout": (result.stdout or "").strip(),
+            "stderr": (result.stderr or "").strip(),
+        })
+
+    if raw["disk_root_percent"] > 85 or raw["disk_home_percent"] > 85:
+        cleanup_cmd = "sudo find /tmp /var/tmp -xdev -type f -mtime +3 -delete"
+        result = _run_in_sandbox(cleanup_cmd, timeout=30)
+        actions.append({
+            "action": "清理 /tmp 和 /var/tmp 的历史临时文件",
+            "success": result.returncode == 0,
+            "stdout": (result.stdout or "").strip(),
+            "stderr": (result.stderr or "").strip(),
+        })
+
+    return actions
+
+
+def run_system_health_check(trigger: str, auto_heal: bool = True) -> Dict[str, Any]:
+    global last_system_health_report
+
+    checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report: Dict[str, Any] = {
+        "checked_at": checked_at,
+        "trigger": trigger,
+        "auto_heal_enabled": auto_heal,
+        "overall_is_normal": False,
+        "metrics": {},
+        "top_process": "",
+        "self_heal": {
+            "attempted": False,
+            "actions": [],
+            "summary": "未触发",
+        },
+        "error": None,
+    }
+
+    try:
+        raw_before = _collect_system_health_raw()
+        metrics_before = _evaluate_health(raw_before)
+        before_ok = all(m["is_normal"] for m in metrics_before.values())
+
+        report["metrics"] = metrics_before
+        report["top_process"] = raw_before.get("top_process", "")
+        report["overall_is_normal"] = before_ok
+
+        if auto_heal and not before_ok:
+            actions = _attempt_self_heal(raw_before, metrics_before)
+            if actions:
+                report["self_heal"]["attempted"] = True
+                report["self_heal"]["actions"] = actions
+                raw_after = _collect_system_health_raw()
+                metrics_after = _evaluate_health(raw_after)
+                after_ok = all(m["is_normal"] for m in metrics_after.values())
+                report["metrics_before_heal"] = metrics_before
+                report["metrics"] = metrics_after
+                report["top_process"] = raw_after.get("top_process", "")
+                report["overall_is_normal_before_heal"] = before_ok
+                report["overall_is_normal"] = after_ok
+                report["self_heal"]["summary"] = "修复后已恢复正常" if after_ok else "已尝试修复，但仍有异常"
+            else:
+                report["self_heal"]["summary"] = "检测到异常，但当前规则无可执行修复动作"
+
+    except Exception as e:
+        report["error"] = str(e)
+        report["self_heal"]["summary"] = "检查流程异常"
+
+    with health_lock:
+        last_system_health_report = report
+
+    return report
+
+
 def system_check_job():
     logging.info(">>> 触发定时心跳：执行系统体检与自动异常排查 <<<")
-    if not agent:
-        return
-    task = "现在是一个小时一次的隐式后台巡检时间。请调用 Sandbox_Health_Scanner 检查状态。如果一切正常只回应一句话，不要使用多余工具凑步数。"
-    try:
-        response = agent.run(task)
-        logging.info(f"✨ 调度体检汇报完毕:\n{response}")
-    except Exception as e:
-        logging.error(f"❌ 体检崩溃: {str(e)}")
+    report = run_system_health_check(trigger="scheduled", auto_heal=True)
+    if report.get("error"):
+        logging.error(f"❌ 定时体检异常: {report['error']}")
+    else:
+        status = "正常" if report.get("overall_is_normal") else "异常"
+        heal = report.get("self_heal", {}).get("summary", "未触发")
+        logging.info(f"✨ 定时体检完成: 状态={status} | 自愈={heal}")
 
 
 # ========== WebSocket 消息群发机制 ==========
@@ -94,6 +299,12 @@ async def lifespan(app: FastAPI):
         task_mgr.sync_internal_tasks()
         task_mgr.sync_sandbox_tasks()
     scheduler.add_job(_periodic_sync, 'interval', seconds=60, id="db_sync_job")
+
+    # 启动后先做一次健康检查，避免前端首次进入无数据
+    def _initial_health_probe():
+        run_system_health_check(trigger="startup", auto_heal=True)
+        logging.info("🩺 启动健康探针完成")
+    threading.Thread(target=_initial_health_probe, daemon=True).start()
 
     # 实例化工具全家桶（传入 task_mgr）
     bash_tool = SandboxBashExecutor()
@@ -338,6 +549,8 @@ async def sandbox_write(req: SandboxFileReq):
         return {"status": "error", "msg": str(e)}
 
 
+
+
 # ========== 日志 API ==========
 
 @app.get("/api/logs")
@@ -353,7 +566,23 @@ async def get_logs(lines: int = 100):
         return {"lines": [], "error": str(e)}
 
 
-# ========== 供前端聊天调用的 WS 全双工通道 ==========
+class HealthCheckReq(BaseModel):
+    auto_heal: bool = True
+
+
+@app.get("/api/system/health")
+async def get_system_health():
+    with health_lock:
+        report = last_system_health_report
+    if report is None:
+        report = run_system_health_check(trigger="api_fallback", auto_heal=True)
+    return report
+
+
+@app.post("/api/system/health/check")
+async def trigger_system_health_check(req: HealthCheckReq):
+    report = await asyncio.to_thread(run_system_health_check, "manual", req.auto_heal)
+    return {"status": "success", "report": report}
 
 @app.websocket("/ws/chat")
 async def websocket_endpoint(websocket: WebSocket):

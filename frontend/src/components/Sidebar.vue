@@ -7,6 +7,7 @@ const emit = defineEmits(['navigate'])
 const navItems = [
   { id: 'dashboard', icon: '📊', label: '概览' },
   { id: 'tasks',     icon: '📝', label: '任务' },
+  { id: 'health',    icon: '🩺', label: '健康' },
   { id: 'scripts',   icon: '📄', label: '脚本' },
   { id: 'logs',      icon: '📋', label: '日志' },
   { id: 'chat',      icon: '💬', label: 'AI' },
