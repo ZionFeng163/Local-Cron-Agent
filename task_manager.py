@@ -19,6 +19,7 @@ from models import (
     get_recent_task_runs, insert_task_heal_record,
     get_task_heal_records, count_task_heal_records
 )
+from redis_state import redis_state
 
 logger = logging.getLogger(__name__)
 
@@ -70,38 +71,40 @@ class TaskManager:
 
     def toggle_task(self, task_id: str) -> Optional[Task]:
         """切换任务状态：先更新 DB，再异步推送"""
-        task = get_task(task_id)
-        if not task:
-            return None
+        with redis_state.lock(f"task:{task_id}", ttl=20):
+            task = get_task(task_id)
+            if not task:
+                return None
 
-        new_status = "paused" if task.status == "running" else "running"
-        update_task_status(task_id, new_status)
-        task.status = new_status
-        logger.info(f"🔄 任务状态已更新: {task.name} → {new_status}")
+            new_status = "paused" if task.status == "running" else "running"
+            update_task_status(task_id, new_status)
+            task.status = new_status
+            logger.info(f"🔄 任务状态已更新: {task.name} → {new_status}")
 
-        if task.source == "sandbox":
-            threading.Thread(target=self._sync_push_sandbox_toggle, args=(task,), daemon=True).start()
-        elif task.source == "internal" and self.scheduler:
-            if new_status == "paused":
-                self.scheduler.pause_job(task.id)
-            else:
-                self.scheduler.resume_job(task.id)
+            if task.source == "sandbox":
+                threading.Thread(target=self._sync_push_sandbox_toggle, args=(task,), daemon=True).start()
+            elif task.source == "internal" and self.scheduler:
+                if new_status == "paused":
+                    self.scheduler.pause_job(task.id)
+                else:
+                    self.scheduler.resume_job(task.id)
 
-        return task
+            return task
 
     def remove_task(self, task_id: str) -> bool:
         """删除任务：先从 DB 删除，再异步清除执行环境"""
-        task = get_task(task_id)
-        if not task:
-            return False
+        with redis_state.lock(f"task:{task_id}", ttl=20):
+            task = get_task(task_id)
+            if not task:
+                return False
 
-        delete_task(task_id)
-        logger.info(f"🗑️ 任务已从 DB 删除: {task.name}")
+            delete_task(task_id)
+            logger.info(f"🗑️ 任务已从 DB 删除: {task.name}")
 
-        if task.source == "sandbox":
-            threading.Thread(target=self._sync_push_sandbox_full, daemon=True).start()
+            if task.source == "sandbox":
+                threading.Thread(target=self._sync_push_sandbox_full, daemon=True).start()
 
-        return True
+            return True
 
     # ==================== 内部心跳同步 ====================
 
@@ -307,18 +310,19 @@ class TaskManager:
     def _sync_push_sandbox_add(self, task: Task):
         """将单条新任务推送到沙盒 crontab"""
         try:
-            self._ensure_runlog_dir()
-            entry = self._render_cron_entry(task)
-            safe_entry = shlex.quote(entry)
-            sh_cmd = f"(crontab -l 2>/dev/null; echo {safe_entry}) | crontab -"
-            safe_cmd = shlex.quote(sh_cmd)
-            subprocess.run(
-                f"/usr/local/bin/multipass exec agent-sandbox -- bash -c {safe_cmd}",
-                shell=True, timeout=20
-            )
-            update_task_status(task.id, task.status)
-            task.last_synced_at = _now()
-            upsert_task(task)
+            with redis_state.lock("sandbox:crontab", ttl=45, wait_timeout=10):
+                self._ensure_runlog_dir()
+                entry = self._render_cron_entry(task)
+                safe_entry = shlex.quote(entry)
+                sh_cmd = f"(crontab -l 2>/dev/null; echo {safe_entry}) | crontab -"
+                safe_cmd = shlex.quote(sh_cmd)
+                subprocess.run(
+                    f"/usr/local/bin/multipass exec agent-sandbox -- bash -c {safe_cmd}",
+                    shell=True, timeout=20
+                )
+                update_task_status(task.id, task.status)
+                task.last_synced_at = _now()
+                upsert_task(task)
             logger.info(f"📤 任务已推送至沙盒: {task.name}")
         except Exception as e:
             logger.error(f"推送到沙盒失败: {e}")
@@ -326,36 +330,37 @@ class TaskManager:
     def _sync_push_sandbox_toggle(self, task: Task):
         """切换沙盒中某条任务的暂停/恢复状态"""
         try:
-            safe_cmd = shlex.quote("crontab -l")
-            result = subprocess.run(
-                f"/usr/local/bin/multipass exec agent-sandbox -- bash -c {safe_cmd}",
-                shell=True, capture_output=True, text=True, timeout=20
-            )
-            current = result.stdout
+            with redis_state.lock("sandbox:crontab", ttl=45, wait_timeout=10):
+                safe_cmd = shlex.quote("crontab -l")
+                result = subprocess.run(
+                    f"/usr/local/bin/multipass exec agent-sandbox -- bash -c {safe_cmd}",
+                    shell=True, capture_output=True, text=True, timeout=20
+                )
+                current = result.stdout
 
-            new_lines = []
-            target_marker = f"#LCA_TASK_ID={task.id}"
-            for line in current.split("\n"):
-                stripped = line.strip()
-                if not stripped:
-                    new_lines.append(line)
-                    continue
-                if target_marker in stripped:
-                    if task.status == "paused" and not stripped.startswith("#⏸️ "):
-                        new_lines.append(f"#⏸️ {stripped}")
-                    elif task.status == "running" and stripped.startswith("#⏸️ "):
-                        new_lines.append(stripped.replace("#⏸️ ", "", 1))
+                new_lines = []
+                target_marker = f"#LCA_TASK_ID={task.id}"
+                for line in current.split("\n"):
+                    stripped = line.strip()
+                    if not stripped:
+                        new_lines.append(line)
+                        continue
+                    if target_marker in stripped:
+                        if task.status == "paused" and not stripped.startswith("#⏸️ "):
+                            new_lines.append(f"#⏸️ {stripped}")
+                        elif task.status == "running" and stripped.startswith("#⏸️ "):
+                            new_lines.append(stripped.replace("#⏸️ ", "", 1))
+                        else:
+                            new_lines.append(line)
                     else:
                         new_lines.append(line)
-                else:
-                    new_lines.append(line)
 
-            new_crontab = "\n".join(new_lines)
-            safe_cron = shlex.quote(new_crontab)
-            subprocess.run(
-                f"echo {safe_cron} | /usr/local/bin/multipass exec agent-sandbox -- crontab -",
-                shell=True, timeout=20
-            )
+                new_crontab = "\n".join(new_lines)
+                safe_cron = shlex.quote(new_crontab)
+                subprocess.run(
+                    f"echo {safe_cron} | /usr/local/bin/multipass exec agent-sandbox -- crontab -",
+                    shell=True, timeout=20
+                )
             logger.info(f"📤 沙盒任务状态已同步: {task.name} → {task.status}")
         except Exception as e:
             logger.error(f"沙盒 toggle 同步失败: {e}")
@@ -363,16 +368,17 @@ class TaskManager:
     def _sync_push_sandbox_full(self):
         """用 DB 数据全量覆写沙盒 crontab"""
         try:
-            self._ensure_runlog_dir()
-            sandbox_tasks = get_all_tasks(source="sandbox")
-            lines = [self._render_cron_entry(t) for t in sandbox_tasks]
+            with redis_state.lock("sandbox:crontab", ttl=45, wait_timeout=10):
+                self._ensure_runlog_dir()
+                sandbox_tasks = get_all_tasks(source="sandbox")
+                lines = [self._render_cron_entry(t) for t in sandbox_tasks]
 
-            new_crontab = "\n".join(lines) + "\n" if lines else ""
-            safe_cron = shlex.quote(new_crontab)
-            subprocess.run(
-                f"echo {safe_cron} | /usr/local/bin/multipass exec agent-sandbox -- crontab -",
-                shell=True, timeout=20
-            )
+                new_crontab = "\n".join(lines) + "\n" if lines else ""
+                safe_cron = shlex.quote(new_crontab)
+                subprocess.run(
+                    f"echo {safe_cron} | /usr/local/bin/multipass exec agent-sandbox -- crontab -",
+                    shell=True, timeout=20
+                )
             logger.info(f"📤 沙盒 crontab 已全量重写（{len(lines)} 条）")
         except Exception as e:
             logger.error(f"沙盒全量同步失败: {e}")
@@ -804,4 +810,3 @@ echo "$TOTAL" > {self.run_log_state_file}
 
     def get_task_runs(self, task_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         return get_recent_task_runs(task_id, limit)
-

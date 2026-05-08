@@ -1,6 +1,7 @@
 import logging
 import re
 import threading
+import uuid
 from typing import Annotated, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -9,6 +10,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
+from redis_state import redis_state
 from streaming_fc_agent import StreamingFCAgent
 
 logger = logging.getLogger(__name__)
@@ -20,6 +22,7 @@ class AgentState(TypedDict):
     current_task_idx: int
     execution_context: str
     final_answer: str
+    run_id: str
 
 
 class LangGraphOrchestrator:
@@ -167,6 +170,10 @@ class LangGraphOrchestrator:
         cb = self._extract_callback(config)
         user_input = state["messages"][0].content
         task_list = self._build_plan(user_input)
+        redis_state.set_run_status(
+            state["run_id"],
+            {"status": "planned", "total_steps": len(task_list), "current_step": 0},
+        )
         self._emit_status(cb, f"🧭 已规划 {len(task_list)} 个步骤，开始执行。")
         return {
             "task_list": task_list,
@@ -183,6 +190,17 @@ class LangGraphOrchestrator:
         cb = self._extract_callback(config)
         route = self._route_task(task)
         worker = self._get_worker(route)
+        redis_state.set_run_status(
+            state["run_id"],
+            {
+                "status": "running",
+                "current_step": idx + 1,
+                "total_steps": len(state["task_list"]),
+                "route": route,
+                "worker": worker.name,
+                "task": task,
+            },
+        )
         self._emit_status(cb, f"🚀 步骤 {idx + 1}/{len(state['task_list'])}: {task}")
         self._emit_status(cb, f"🧩 已路由至 {worker.name}")
 
@@ -200,6 +218,17 @@ class LangGraphOrchestrator:
         new_context = state["execution_context"] + f"\n[步骤 {idx + 1}] {task}\n结果: {compact_res}\n"
         if len(new_context) > 2400:
             new_context = new_context[-2400:]
+        redis_state.set_run_status(
+            state["run_id"],
+            {
+                "status": "step_completed",
+                "current_step": idx + 1,
+                "total_steps": len(state["task_list"]),
+                "route": route,
+                "worker": worker.name,
+                "task": task,
+            },
+        )
 
         if self.task_mgr:
             self.task_mgr.sync_internal_tasks()
@@ -215,6 +244,7 @@ class LangGraphOrchestrator:
     def solver_node(self, state: AgentState, config: Optional[RunnableConfig] = None):
         logger.info("--- SOLVER ---")
         cb = self._extract_callback(config)
+        redis_state.set_run_status(state["run_id"], {"status": "completed"})
         self._emit_status(cb, "📝 正在收尾并返回结果...")
         return {
             "final_answer": "✅ 多步骤任务执行完成。",
@@ -226,12 +256,18 @@ class LangGraphOrchestrator:
             return "next"
         return "done"
 
-    def run_stream(self, user_input: str, callback: callable = None):
+    def run_stream(self, user_input: str, callback: callable = None, run_id: str = ""):
+        run_id = run_id or f"run-{uuid.uuid4().hex[:12]}"
+        redis_state.set_run_status(run_id, {"status": "received", "input": user_input[:500]})
         # Fast-track for short instructions
         if len(user_input.strip()) < 25:
             logger.info(">>> Fast-Track Triggered: Skipping LangGraph Planning <<<")
             route = self._route_task(user_input)
             worker = self._get_worker(route)
+            redis_state.set_run_status(
+                run_id,
+                {"status": "running", "route": route, "worker": worker.name, "input": user_input[:500]},
+            )
             if callback:
                 callback({"type": "status", "content": f"🧩 已路由至 {worker.name}"})
             for chunk in worker.run_stream(user_input):
@@ -239,6 +275,7 @@ class LangGraphOrchestrator:
             if self.task_mgr:
                 self.task_mgr.sync_internal_tasks()
                 threading.Thread(target=self.task_mgr.sync_sandbox_tasks, daemon=True).start()
+            redis_state.set_run_status(run_id, {"status": "completed", "route": route, "worker": worker.name})
             yield {"type": "message", "content": "✅ 指令已快速执行完毕。"}
             return
 
@@ -249,6 +286,7 @@ class LangGraphOrchestrator:
             "current_task_idx": 0,
             "execution_context": "",
             "final_answer": "",
+            "run_id": run_id,
         }
         config: RunnableConfig = {"configurable": {"callback": callback}}
 

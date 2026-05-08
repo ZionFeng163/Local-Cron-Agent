@@ -4,6 +4,7 @@ import os
 import json
 import queue
 import threading
+import uuid
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -33,6 +34,7 @@ from exquisite_agent.tools.searchtool import SearchTool
 from task_manager import TaskManager
 from langgraph_orchestrator import LangGraphOrchestrator
 from streaming_fc_agent import StreamingFCAgent
+from redis_state import redis_state
 
 # 日志输出配置
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s', datefmt='%H:%M:%S')
@@ -701,6 +703,16 @@ async def trigger_system_health_check(req: HealthCheckReq):
     report = await asyncio.to_thread(run_system_health_check, "manual", req.auto_heal)
     return {"status": "success", "report": report}
 
+
+@app.get("/api/agent/runs/{run_id}")
+async def get_agent_run_status(run_id: str):
+    status = redis_state.get_run_status(run_id)
+    return {
+        "run_id": run_id,
+        "redis_enabled": redis_state.enabled,
+        "status": status,
+    }
+
 @app.websocket("/ws/chat")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -711,21 +723,22 @@ async def websocket_endpoint(websocket: WebSocket):
             logging.info(f"UI 用户发送了: {user_msg}")
 
             q = queue.Queue()
+            run_id = f"run-{uuid.uuid4().hex[:12]}"
 
-            def sync_worker(msg, q_out):
+            def sync_worker(msg, q_out, rid):
                 try:
                     # 使用 LangGraph 编排器运行流，并传入回调函数实时推送工具消息
-                    for chunk in orchestrator.run_stream(msg, callback=lambda c: q_out.put(c)):
+                    for chunk in orchestrator.run_stream(msg, callback=lambda c: q_out.put(c), run_id=rid):
                         q_out.put(chunk)
                     q_out.put(None)
                 except Exception as e:
                     q_out.put({"type": "message", "content": f"\n\n[核心异常]: {str(e)}"})
                     q_out.put(None)
 
-            thread = threading.Thread(target=sync_worker, args=(user_msg, q))
+            thread = threading.Thread(target=sync_worker, args=(user_msg, q, run_id))
             thread.start()
 
-            await websocket.send_json({"type": "stream_start"})
+            await websocket.send_json({"type": "stream_start", "run_id": run_id})
             last_heartbeat_ts = asyncio.get_running_loop().time()
 
             while True:
