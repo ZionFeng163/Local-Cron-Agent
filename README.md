@@ -17,6 +17,8 @@
   Turn natural-language instructions into scheduled jobs, sandbox actions, health checks, and recovery workflows through a layered multi-agent system.
 </p>
 
+<img src="docs/images/dashboard.png" alt="Local Cron Agent dashboard" width="100%">
+
 </div>
 
 ---
