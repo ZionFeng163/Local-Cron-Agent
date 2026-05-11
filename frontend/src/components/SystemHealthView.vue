@@ -60,7 +60,7 @@ onMounted(loadLatest)
   <div class="view-container">
     <div class="view-header">
       <div>
-        <h2>🩺 系统健康检查</h2>
+        <h2>系统健康检查</h2>
         <p class="view-subtitle">展示最近一次检查结果，并支持一键手动体检 + 自愈</p>
       </div>
       <button class="table-btn btn-success" @click="triggerCheck" :disabled="checking">

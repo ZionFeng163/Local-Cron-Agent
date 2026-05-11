@@ -74,7 +74,7 @@ onMounted(() => fetchDir(currentPath.value))
 <template>
   <div class="view-container script-editor-layout">
     <div class="view-header">
-      <h2>📄 沙盒脚本编辑器</h2>
+      <h2>沙盒脚本编辑器</h2>
       <p class="view-subtitle">浏览、查看并编辑沙盒内的文件</p>
     </div>
 

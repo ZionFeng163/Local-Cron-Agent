@@ -37,7 +37,7 @@ watch(() => props.messages, () => {
 <template>
   <div class="view-container chat-full">
     <div class="view-header">
-      <h2>💬 AI 智能管家</h2>
+      <h2>AI 智能管家</h2>
       <div class="status-indicator">
         <div class="status-dot"></div> 在线
       </div>

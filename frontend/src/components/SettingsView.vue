@@ -21,7 +21,7 @@ onMounted(fetchHealth)
 <template>
   <div class="view-container">
     <div class="view-header">
-      <h2>⚙️ 系统设置</h2>
+      <h2>系统设置</h2>
       <p class="view-subtitle">系统配置与环境信息</p>
     </div>
 

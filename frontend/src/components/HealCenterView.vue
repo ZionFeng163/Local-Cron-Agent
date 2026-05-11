@@ -124,7 +124,7 @@ onMounted(refreshAll)
   <div class="view-container">
     <div class="view-header">
       <div>
-        <h2>🛠️ 自愈中心</h2>
+        <h2>自愈中心</h2>
         <p class="view-subtitle">统一查看自愈返回值含义与历史记录</p>
       </div>
       <button class="table-btn btn-success" @click="refreshAll">刷新</button>

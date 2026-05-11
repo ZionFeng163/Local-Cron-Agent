@@ -1,13 +1,15 @@
 import logging
+import json
 import re
 import threading
 import uuid
-from typing import Annotated, Dict, List, Optional
+from typing import Annotated, Dict, List, Optional, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
 from redis_state import redis_state
@@ -25,6 +27,12 @@ class AgentState(TypedDict):
     run_id: str
 
 
+class RouteDecision(BaseModel):
+    route: Literal["cron", "script", "ops", "research", "general"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str = ""
+
+
 class LangGraphOrchestrator:
     """
     Lightweight orchestrator:
@@ -40,6 +48,8 @@ class LangGraphOrchestrator:
 
         self.worker_agents = self._build_worker_agents(LLM)
         self.worker_agent = self.worker_agents["general"]
+        self.router_llm = LLM()
+        self.router_confidence_threshold = 0.6
         self.graph = self._build_graph()
 
     def _pick_tools(self, tool_names: List[str]):
@@ -85,7 +95,7 @@ class LangGraphOrchestrator:
             ),
         }
 
-    def _route_task(self, task: str) -> str:
+    def _route_task_rule(self, task: str) -> str:
         text = task.lower()
 
         cron_keywords = [
@@ -114,6 +124,78 @@ class LangGraphOrchestrator:
         }
         route, score = max(scores.items(), key=lambda item: item[1])
         return route if score > 0 else "general"
+
+    def _extract_route_json_text(self, content: str) -> str:
+        if not content:
+            return ""
+        text = content.strip()
+        if text.startswith("{") and text.endswith("}"):
+            return text
+
+        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S)
+        if fenced:
+            return fenced.group(1)
+
+        obj_match = re.search(r"(\{.*\})", text, flags=re.S)
+        if obj_match:
+            return obj_match.group(1)
+        return ""
+
+    def _parse_route_decision(self, content: str) -> RouteDecision:
+        json_text = self._extract_route_json_text(content)
+        if not json_text:
+            raise ValueError("empty route json")
+        return RouteDecision.model_validate_json(json_text)
+
+    def _llm_route_task(self, task: str, execution_context: str = "") -> Dict[str, object]:
+        allowed_routes = {"cron", "script", "ops", "research", "general"}
+        fallback = self._route_task_rule(task)
+        short_ctx = (execution_context or "")[-800:]
+
+        sys_prompt = (
+            "你是一个任务路由器。"
+            "只做分类，不执行任务。"
+            "你必须严格输出 JSON，不要输出任何额外文本。"
+            "可选 route 仅限: cron, script, ops, research, general。"
+            "输出格式: {\"route\":\"...\",\"confidence\":0-1,\"reason\":\"...\"}。"
+            "若信息不足，请选择 general。"
+            "优先最小能力匹配。"
+        )
+        user_prompt = (
+            f"任务: {task}\n"
+            f"最近上下文(可能为空): {short_ctx}\n"
+            "请返回 JSON。"
+        )
+        try:
+            resp = self.router_llm.chat(
+                [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
+                []
+            )
+            decision = self._parse_route_decision(getattr(resp, "content", "") or "")
+            route = decision.route
+            confidence = decision.confidence
+            reason = decision.reason.strip()
+
+            if route not in allowed_routes or confidence < self.router_confidence_threshold:
+                return {
+                    "route": fallback,
+                    "confidence": confidence,
+                    "reason": reason or "llm_confidence_low_or_invalid_route",
+                    "source": "fallback_rule",
+                }
+            return {
+                "route": route,
+                "confidence": confidence,
+                "reason": reason,
+                "source": "llm",
+            }
+        except Exception as e:
+            return {
+                "route": fallback,
+                "confidence": 0.0,
+                "reason": f"llm_route_exception: {e}",
+                "source": "fallback_rule",
+            }
 
     def _get_worker(self, route: str) -> StreamingFCAgent:
         return self.worker_agents.get(route, self.worker_agents["general"])
@@ -188,7 +270,8 @@ class LangGraphOrchestrator:
         logger.info(f"--- EXECUTOR {idx + 1} ---")
 
         cb = self._extract_callback(config)
-        route = self._route_task(task)
+        route_info = self._llm_route_task(task, state.get("execution_context", ""))
+        route = str(route_info.get("route", "general"))
         worker = self._get_worker(route)
         redis_state.set_run_status(
             state["run_id"],
@@ -197,12 +280,18 @@ class LangGraphOrchestrator:
                 "current_step": idx + 1,
                 "total_steps": len(state["task_list"]),
                 "route": route,
+                "route_source": route_info.get("source", "unknown"),
+                "route_confidence": route_info.get("confidence", 0),
+                "route_reason": route_info.get("reason", ""),
                 "worker": worker.name,
                 "task": task,
             },
         )
         self._emit_status(cb, f"🚀 步骤 {idx + 1}/{len(state['task_list'])}: {task}")
-        self._emit_status(cb, f"🧩 已路由至 {worker.name}")
+        self._emit_status(
+            cb,
+            f"🧩 已路由至 {worker.name} (source={route_info.get('source')}, conf={route_info.get('confidence', 0):.2f})",
+        )
 
         executor_res = ""
         for chunk in worker.run_stream(task):
@@ -262,14 +351,31 @@ class LangGraphOrchestrator:
         # Fast-track for short instructions
         if len(user_input.strip()) < 25:
             logger.info(">>> Fast-Track Triggered: Skipping LangGraph Planning <<<")
-            route = self._route_task(user_input)
+            route_info = self._llm_route_task(user_input, "")
+            route = str(route_info.get("route", "general"))
             worker = self._get_worker(route)
             redis_state.set_run_status(
                 run_id,
-                {"status": "running", "route": route, "worker": worker.name, "input": user_input[:500]},
+                {
+                    "status": "running",
+                    "route": route,
+                    "route_source": route_info.get("source", "unknown"),
+                    "route_confidence": route_info.get("confidence", 0),
+                    "route_reason": route_info.get("reason", ""),
+                    "worker": worker.name,
+                    "input": user_input[:500],
+                },
             )
             if callback:
-                callback({"type": "status", "content": f"🧩 已路由至 {worker.name}"})
+                callback(
+                    {
+                        "type": "status",
+                        "content": (
+                            f"🧩 已路由至 {worker.name} "
+                            f"(source={route_info.get('source')}, conf={route_info.get('confidence', 0):.2f})"
+                        ),
+                    }
+                )
             for chunk in worker.run_stream(user_input):
                 yield chunk
             if self.task_mgr:

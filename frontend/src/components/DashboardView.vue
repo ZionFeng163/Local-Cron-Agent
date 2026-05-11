@@ -47,7 +47,7 @@ defineExpose({ fetchData })
 <template>
   <div class="view-container">
     <div class="view-header">
-      <h2>📊 系统概览</h2>
+      <h2>系统概览</h2>
       <p class="view-subtitle">全局状态一览</p>
     </div>
 

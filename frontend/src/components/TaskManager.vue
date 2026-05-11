@@ -68,7 +68,7 @@ const fmtExitCode = (v) => (v === null || v === undefined ? '---' : String(v))
 <template>
   <div class="view-container">
     <div class="view-header">
-      <h2>📝 任务管理</h2>
+      <h2>任务管理</h2>
       <p class="view-subtitle">查看、暂停、启动或删除所有定时任务</p>
     </div>
 

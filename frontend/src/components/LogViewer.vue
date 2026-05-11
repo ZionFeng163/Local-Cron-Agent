@@ -41,7 +41,7 @@ const getLogClass = (line) => {
 <template>
   <div class="view-container">
     <div class="view-header">
-      <h2>📋 运行日志</h2>
+      <h2>运行日志</h2>
       <div class="log-controls">
         <label class="auto-scroll-label">
           <input type="checkbox" v-model="autoScroll" /> 自动滚动
