@@ -50,20 +50,19 @@ Instead of one monolithic agent loop, responsibilities are split:
 flowchart LR
     UI["Vue 3 Console"] --> API["FastAPI + WebSocket"]
     API --> ORCH["LangGraph Orchestrator"]
-    ORCH --> EXEC["Executor"]
-    EXEC --> WORKER["Streaming Worker Agent"]
-    WORKER --> TOOLS["Tool Layer"]
+    ORCH --> PLAN["Planner"]
+    PLAN --> ROUTER["LLM Router"]
+    ROUTER --> EXEC["Executor"]
 
-    TOOLS --> CRON["Sandbox Crontab Admin"]
-    TOOLS --> BASH["Sandbox Bash Executor"]
-    TOOLS --> FILE["Sandbox File Writer"]
-    TOOLS --> HEALTH["Health Scanner"]
-    TOOLS --> SERVICE["Service Manager"]
-    TOOLS --> HEARTBEAT["Agent Heartbeat Controller"]
+    EXEC --> CRONW["CronWorker"]
+    EXEC --> SCRIPTW["ScriptWorker"]
+    EXEC --> OPSW["OpsWorker"]
+    EXEC --> RESEARCHW["ResearchWorker"]
+    EXEC --> GENERALW["GeneralWorker"]
 
     API --> TM["TaskManager"]
     TM --> DB["SQLite"]
-    TOOLS --> VM["Multipass Sandbox"]
+    API --> VM["Multipass Sandbox"]
 ```
 
 ## Core Screens
