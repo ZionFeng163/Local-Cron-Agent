@@ -2,7 +2,7 @@
 
 # Local Cron Agent
 
-### A multi-agent control plane for local automation, scheduling, and self-healing
+### A local-first multi-agent control plane for automation, scheduling, and self-healing
 
 <p>
   <img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
@@ -14,7 +14,7 @@
 </p>
 
 <p>
-  Turn natural-language instructions into scheduled jobs, sandbox actions, health checks, and recovery workflows through a layered multi-agent system.
+  Turn natural language into managed cron jobs, sandbox scripts, health checks, and recovery workflows.
 </p>
 
 <img src="docs/images/dashboard.png" alt="Local Cron Agent dashboard" width="100%">
@@ -25,56 +25,32 @@
 
 ## Overview
 
-Local Cron Agent is a local-first automation platform built around a **multi-agent collaboration model**.
+Local Cron Agent is a compact operations console for local automation.  
+It combines a Vue dashboard, FastAPI backend, LangGraph orchestration, and a sandbox tool layer to safely run and manage scheduled tasks.
 
-Instead of letting one monolithic agent do everything, the system splits responsibilities across:
+Instead of one monolithic agent loop, responsibilities are split:
 
-- an **Orchestrator Agent** that plans and coordinates work,
-- a **Worker Agent** that executes each step,
-- and a **tool layer** specialized in cron management, shell execution, file generation, service control, system inspection, and recovery actions.
+- **Orchestrator**: planning and step-level flow control.
+- **Worker Agents**: execution by capability domain.
+- **Tool Layer**: cron admin, shell execution, file writing, service control, health scan.
+- **State Layer**: unified task state and run history in SQLite.
 
-The result is a control surface where users can chat with the system, inspect scheduled jobs, repair failed tasks, browse sandbox files, and monitor health status from one interface.
+## What Makes It Useful
 
-## Why It Feels Different
-
-Most cron dashboards stop at CRUD.  
-Local Cron Agent goes further:
-
-- it accepts natural-language requests instead of only form input,
-- it executes through a multi-agent pipeline instead of a single opaque loop,
-- it streams progress back to the UI so execution feels alive,
-- and it closes the loop with health checks and self-healing history.
-
-## Multi-Agent Design
-
-This project is presented as a **real multi-agent collaborative system** with clear role separation.
-
-| Layer | Role | Responsibility |
-| --- | --- | --- |
-| Orchestrator | Planner / Executor / Solver | Breaks down requests, manages state transitions, sequences work, and closes tasks |
-| Worker Agent | Streaming execution agent | Handles step-level reasoning, tool calling, streaming progress, and result emission |
-| Tool Agents | Domain capability layer | Cron admin, shell execution, file writing, health scanning, service control, search |
-| State Layer | TaskManager + SQLite | Stores job state, sync status, run history, heal records |
-| Memory Layer | ChromaDB + short-term context | Retains reusable SOP-like patterns and recent task context |
-
-### How a complex request flows
-
-1. A user sends a natural-language request from the Web UI.
-2. The **LangGraph Orchestrator** converts that request into a stepwise execution plan.
-3. The **Worker Agent** executes each step and calls the right tool.
-4. Progress events stream back over WebSocket in real time.
-5. Task status, health results, and recovery actions are persisted into the local data store.
+- Natural-language task management through chat.
+- Multi-agent task routing and execution flow.
+- Real-time stream feedback over WebSocket.
+- Unified view of internal heartbeat jobs + sandbox cron jobs.
+- Built-in health checks and auto-heal records.
+- Local sandbox boundary (Multipass) for safer command execution.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    UI["Vue 3 Control Console"] --> API["FastAPI + WebSocket"]
+    UI["Vue 3 Console"] --> API["FastAPI + WebSocket"]
     API --> ORCH["LangGraph Orchestrator"]
-    ORCH --> PLAN["Planner"]
     ORCH --> EXEC["Executor"]
-    ORCH --> SOLVE["Solver"]
-
     EXEC --> WORKER["Streaming Worker Agent"]
     WORKER --> TOOLS["Tool Layer"]
 
@@ -83,45 +59,30 @@ flowchart LR
     TOOLS --> FILE["Sandbox File Writer"]
     TOOLS --> HEALTH["Health Scanner"]
     TOOLS --> SERVICE["Service Manager"]
-    TOOLS --> SEARCH["Search Tool"]
+    TOOLS --> HEARTBEAT["Agent Heartbeat Controller"]
 
     API --> TM["TaskManager"]
     TM --> DB["SQLite"]
-    WORKER --> MEM["ChromaDB Memory"]
     TOOLS --> VM["Multipass Sandbox"]
 ```
 
-## Product Surfaces
+## Core Screens
 
-The frontend is not just a chat window. It is a compact operations console with multiple views:
-
-- **Dashboard**: overall status for internal jobs and sandbox jobs
-- **Tasks**: inspect, pause, resume, delete, and repair scheduled tasks
-- **Health**: run system checks and review automated healing results
-- **Heal Center**: browse healing actions, categories, and historical outcomes
-- **Scripts**: browse and edit files inside the sandbox
-- **Logs**: inspect backend runtime logs
-- **AI Chat**: issue requests in natural language and watch execution stream live
-
-## Core Capabilities
-
-| Capability | Description |
-| --- | --- |
-| Natural-language task control | Manage jobs and automation through chat |
-| Multi-agent orchestration | Use LangGraph to coordinate planner, executor, and solver roles |
-| Streaming UX | Push step-level execution status through WebSocket |
-| Unified task state | Merge internal jobs and sandbox cron jobs into one state model |
-| Sandbox operations | Execute shell commands and scripts safely inside Multipass |
-| Health and recovery | Run health probes, apply healing actions, and store recovery records |
-| Memory-backed reuse | Preserve successful patterns through local vector memory |
+- **Dashboard**: status summary and quick task visibility.
+- **Tasks**: pause/resume/delete/heal jobs.
+- **Health**: system check and auto-heal feedback.
+- **Heal Center**: categorized heal history.
+- **Scripts**: sandbox file browser + editor.
+- **Logs**: runtime logs.
+- **AI Chat**: natural-language command surface.
 
 ## Tech Stack
 
 ```text
 Frontend       Vue 3 + Vite
 Backend        FastAPI + WebSocket + APScheduler
-Agents         exquisite_agent + custom StreamingFCAgent
 Orchestration  LangGraph
+Agents         exquisite_agent + custom StreamingFCAgent
 Persistence    SQLite
 Memory         ChromaDB
 Sandbox        Multipass Ubuntu VM
@@ -131,57 +92,50 @@ Sandbox        Multipass Ubuntu VM
 
 ```text
 .
-├── server.py                 # Backend entry, APIs, WebSocket streaming, health workflows
-├── langgraph_orchestrator.py # Multi-agent orchestration layer
-├── streaming_fc_agent.py     # Streaming worker agent
-├── task_manager.py           # Unified task state manager
-├── models.py                 # SQLite data model
-├── tools/                    # Tool implementations
-├── frontend/                 # Vue 3 application
-├── agent_data/               # SQLite + vector memory storage
-├── start.sh                  # Start backend + frontend
-└── stop.sh                   # Stop backend + frontend
+├── server.py                 # API entry + websocket stream + lifecycle jobs
+├── langgraph_orchestrator.py # multi-agent flow + routing
+├── streaming_fc_agent.py     # streaming function-calling worker
+├── task_manager.py           # unified state + sync logic
+├── models.py                 # SQLite models and queries
+├── tools/                    # sandbox and control tools
+├── frontend/                 # Vue application
+├── agent_data/               # SQLite and vector db data
+├── start.sh                  # robust start script
+└── stop.sh                   # robust stop script
 ```
 
 ## Quick Start
 
-### 1. Prepare the sandbox
+### 1) Prepare sandbox
 
 ```bash
 multipass launch 24.04 --name agent-sandbox --cpus 1 --memory 1G --disk 6G
 ```
 
-If the sandbox is broken, rebuild it:
+### 2) Configure environment
 
-```bash
-multipass delete --purge agent-sandbox
-multipass launch 24.04 --name agent-sandbox --cpus 1 --memory 1G --disk 6G
-```
-
-### 2. Configure environment
-
-Create a `.env` with the required runtime values:
+Create `.env` (example):
 
 ```env
 LLM_API_KEY=
-LLM_MODEL_ID=
+LLM_MODEL_ID=qwen3.5-flash
 LLM_BASE_URL=
 SERPAPI_API_KEY=
+
 DB_PERSIST_DIRECTORY=./agent_data/chroma_db
 DB_COLLECTION_SOP=agent_sop_experience
-EMBEDDING_PROVIDER=openai
-EMBEDDING_MODEL=text-embedding-3-small
+
+EMBEDDING_PROVIDER=huggingface
+EMBEDDING_MODEL=google/embeddinggemma-300m
 ```
 
-### 3. Run the app
-
-Recommended:
+### 3) Start
 
 ```bash
 ./start.sh
 ```
 
-Then open:
+Open:
 
 - Frontend: `http://localhost:5173`
 - Backend: `http://localhost:8000`
@@ -190,18 +144,6 @@ Stop:
 
 ```bash
 ./stop.sh
-```
-
-## Manual Run
-
-```bash
-# backend
-python -m uvicorn server:app --host 0.0.0.0 --port 8000
-
-# frontend
-cd frontend
-npm install
-npm run dev
 ```
 
 ## Important APIs
@@ -214,7 +156,7 @@ npm run dev
 - `POST /api/jobs/toggle`
 - `POST /api/jobs/delete`
 
-### Health and Healing
+### Health / Healing
 
 - `GET /api/tasks/health`
 - `GET /api/tasks/{task_id}/runs`
@@ -234,15 +176,13 @@ npm run dev
 
 - `WS /ws/chat`
 
-## Example Use Cases
+## Example Requests
 
-- “List all current jobs and pause the noisy one.”
-- “Write a cleanup script in the sandbox and schedule it to run every hour.”
-- “Inspect system health, repair broken services, and report what changed.”
-- “Show me healing history for failed tasks.”
+- “List all jobs and pause the noisy one.”
+- “Generate a cleanup script in sandbox and schedule it hourly.”
+- “Run system health check and show what was auto-healed.”
 
 ## Notes
 
-- This repository is designed to be viewed as a **multi-agent automation system**, not just a cron UI.
-- The sandbox instance is named `agent-sandbox` by default throughout the project.
-- Local state, logs, and secrets should stay out of version control.
+- Default sandbox name: `agent-sandbox`
+- Keep local secrets and runtime artifacts out of version control.
