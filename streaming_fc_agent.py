@@ -1,11 +1,119 @@
 import threading
 import time
+import uuid
 
 from exquisite_agent.agents.react_fc import FCAgent
 
 
 class StreamingFCAgent(FCAgent):
     """FCAgent with richer progress events during long tool execution."""
+
+    def _clip_text(self, text: str, limit: int = 1200) -> str:
+        text = (text or "").strip()
+        if len(text) <= limit:
+            return text
+        return text[:limit].rstrip() + "..."
+
+    def _split_text_chunks(self, text: str, max_chars: int = 900):
+        """Split long experience text into compact chunks for vector memory."""
+        text = (text or "").strip()
+        if not text:
+            return []
+        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+        if not paragraphs:
+            paragraphs = [text]
+
+        chunks = []
+        current = ""
+        for paragraph in paragraphs:
+            if len(paragraph) > max_chars:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                for start in range(0, len(paragraph), max_chars):
+                    chunks.append(paragraph[start:start + max_chars].strip())
+                continue
+
+            candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
+            if len(candidate) <= max_chars:
+                current = candidate
+            else:
+                chunks.append(current)
+                current = paragraph
+
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _build_experience_chunks(self, user_input: str, final_content: str, tool_trace):
+        tool_lines = []
+        for item in tool_trace:
+            tool_lines.append(
+                f"- 工具: {item['name']}\n"
+                f"  参数: {self._clip_text(item.get('args', ''), 500)}\n"
+                f"  结果: {self._clip_text(item.get('observation', ''), 700)}"
+            )
+
+        sections = []
+        if tool_lines:
+            sections.append("工具调用链路:\n" + "\n".join(tool_lines))
+        if final_content:
+            sections.append("最终处理结果:\n" + self._clip_text(final_content, 1600))
+
+        body = "\n\n".join(sections).strip()
+        if not body:
+            return []
+
+        raw_chunks = self._split_text_chunks(body)
+        total = len(raw_chunks)
+        chunks = []
+        for idx, chunk in enumerate(raw_chunks, start=1):
+            chunks.append(
+                {
+                    "document": (
+                        f"任务目标: {self._clip_text(user_input, 500)}\n"
+                        f"经验片段 {idx}/{total}:\n{chunk}"
+                    ),
+                    "solution": (
+                        f"[可复用 SOP 片段 {idx}/{total}]\n"
+                        f"历史任务: {self._clip_text(user_input, 500)}\n"
+                        f"{chunk}"
+                    ),
+                }
+            )
+        return chunks
+
+    def _consolidate_chunked_memory(self, user_input: str, final_content: str, tool_trace):
+        """Persist successful tool-use experience as small retrievable SOP chunks."""
+        if not tool_trace or not final_content:
+            return
+
+        chunks = self._build_experience_chunks(user_input, final_content, tool_trace)
+        if not chunks:
+            return
+
+        ltm = getattr(getattr(self, "memory", None), "ltm", None)
+        collection = getattr(ltm, "collection", None)
+        if not collection:
+            self.memory.consolidate_memory(user_input, final_content)
+            return
+
+        base_id = uuid.uuid4().hex[:8]
+        collection.add(
+            documents=[chunk["document"] for chunk in chunks],
+            metadatas=[
+                {
+                    "solution": chunk["solution"],
+                    "source": "chunked_tool_experience",
+                    "agent": self.name,
+                    "chunk_index": idx,
+                    "chunk_total": len(chunks),
+                }
+                for idx, chunk in enumerate(chunks, start=1)
+            ],
+            ids=[f"sop_chunk_{base_id}_{idx}" for idx in range(1, len(chunks) + 1)],
+        )
+        print(f"[ChunkedMemory] 已沉淀 {len(chunks)} 个 SOP chunk")
 
     def _prepare_task(self, user_input: str):
         # Important: avoid unbounded short-term-memory growth across requests.
@@ -17,6 +125,7 @@ class StreamingFCAgent(FCAgent):
     def run(self, user_input: str):
         self._prepare_task(user_input)
         tool_used = False
+        tool_trace = []
         for _ in range(self.max_iterations):
             message = self.llm.chat(self.get_full_messages(), self.openai_tools)
             self.add_raw_message(message.model_dump(exclude_none=True))
@@ -34,16 +143,18 @@ class StreamingFCAgent(FCAgent):
                             observation = tool.execute(func_args)
                             break
 
+                    tool_trace.append({"name": func_name, "args": func_args, "observation": str(observation)})
                     self.add_raw_message({"role": "tool", "tool_call_id": tool_id, "content": observation})
             else:
                 if tool_used and message.content:
-                    self.memory.consolidate_memory(user_input, message.content)
+                    self._consolidate_chunked_memory(user_input, message.content, tool_trace)
                 return message.content
 
     def run_stream(self, user_input: str):
         self._prepare_task(user_input)
 
         tool_used = False
+        tool_trace = []
 
         for _ in range(self.max_iterations):
             stream = self.llm.chat_stream(self.get_full_messages(), self.openai_tools)
@@ -124,6 +235,7 @@ class StreamingFCAgent(FCAgent):
                     else:
                         observation = observation_holder["value"]
 
+                    tool_trace.append({"name": func_name, "args": func_args, "observation": str(observation)})
                     self.add_raw_message(
                         {
                             "role": "tool",
@@ -143,6 +255,6 @@ class StreamingFCAgent(FCAgent):
                     yield {"type": "tool_ended", "func_name": func_name}
             else:
                 if tool_used and final_content:
-                    self.memory.consolidate_memory(user_input, final_content)
+                    self._consolidate_chunked_memory(user_input, final_content, tool_trace)
                 yield {"type": "content_end"}
                 return
