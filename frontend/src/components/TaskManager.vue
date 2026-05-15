@@ -36,10 +36,6 @@ const deleteTask = async (event, job) => {
 
 const healTask = async (event, job) => {
   event.stopPropagation()
-  if (job.status === 'RUNNING') {
-    alert('任务运行中，请先暂停后再修复')
-    return
-  }
   try {
     const res = await fetch(`http://localhost:8000/api/tasks/${job.id}/heal`, {
       method: 'POST',
@@ -53,6 +49,8 @@ const healTask = async (event, job) => {
     const lines = [result.msg || '已触发修复']
     if (result.category) lines.push(`失败类型: ${result.category}`)
     if (result.action) lines.push(`动作: ${result.action}`)
+    if (result.exit_code !== undefined && result.exit_code !== null) lines.push(`退出码: ${result.exit_code}`)
+    if (result.failures !== undefined && result.failures !== null) lines.push(`连续失败: ${result.failures}`)
     alert(lines.join('\n'))
 
     emit('refresh')
@@ -139,12 +137,12 @@ const fmtExitCode = (v) => (v === null || v === undefined ? '---' : String(v))
                 <button @click="toggleTask($event, job)" :class="['table-btn', job.status === 'RUNNING' ? 'btn-danger' : 'btn-success']">
                   {{ job.status === 'RUNNING' ? '暂停' : '启动' }}
                 </button>
-                <button @click="healTask($event, job)" class="table-btn btn-success" :disabled="job.status === 'RUNNING'" :title="job.status === 'RUNNING' ? '请先暂停任务再修复' : '立即执行一次修复尝试'">立即修复</button>
+                <button @click="healTask($event, job)" class="table-btn btn-success" title="检查脚本、权限、Cron 条目并试跑一次">立即修复</button>
                 <button @click="deleteTask($event, job)" class="table-btn btn-delete">删除</button>
               </td>
             </tr>
             <tr v-if="ubuntuJobs.length === 0">
-              <td colspan="7" class="empty-row">沙盒中没有配置任何 Crontab 任务</td>
+              <td colspan="7" class="empty-row">沙盒中没有配置任何脚本型定时任务</td>
             </tr>
           </template>
         </tbody>
