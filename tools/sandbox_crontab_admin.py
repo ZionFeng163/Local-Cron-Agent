@@ -2,11 +2,12 @@ import subprocess
 import json
 import shlex
 from exquisite_agent.tools.base import BaseTool
+from script_policy import normalize_script_path, script_name_from_path
 
 
 class SandboxCrontabAdmin(BaseTool):
     name = "Sandbox_Crontab_Admin"
-    description = "用于管理系统定时任务(Crontab)。专门用来安全地增加、删除或查询定时任务。支持命令类型: 'list' (查看当前所有任务), 'add' (增加新任务), 'clear' (清空所有)。注意：无需手动使用 Sandbox_Bash_Executor 修改 crontab，交给我来管理更安全。"
+    description = "用于管理沙盒脚本型定时任务(Crontab)。只允许添加 /home/ubuntu/.lca/scripts/*.sh 脚本任务，支持 list/add/delete/clear。"
 
     def __init__(self, task_mgr=None):
         self.task_mgr = task_mgr
@@ -28,7 +29,7 @@ class SandboxCrontabAdmin(BaseTool):
                     res = "[当前系统中的定时任务列表]:\n"
                     for t in tasks:
                         status = "⏸️暂停" if t.status == "paused" else "▶️运行中"
-                        res += f" - [{status}] {t.cron_expr} {t.command}\n"
+                        res += f" - [{status}] {t.cron_expr} {t.script_path}\n"
                     return res
                 else:
                     # 退化到直接读沙盒
@@ -39,51 +40,54 @@ class SandboxCrontabAdmin(BaseTool):
 
             elif action == "add":
                 cron_expr = args.get("expression")
-                command = args.get("command")
+                script_path = args.get("script_path") or args.get("command")
                 name = args.get("task_name")
                 description = args.get("description")
                 
-                if not cron_expr or not command:
-                    return "[参数错误] add 操作必须提供 'expression' (定时规则) 和 'command' (执行内容)。"
+                if not cron_expr or not script_path:
+                    return "[参数错误] add 操作必须提供 'expression' (定时规则) 和 'script_path' (.sh 脚本路径)。"
+
+                normalized_script_path = normalize_script_path(script_path)
+                if not normalized_script_path:
+                    return "[安全拦截] 定时任务只允许挂载 /home/ubuntu/.lca/scripts/*.sh 脚本。请先用 Sandbox_File_Writer 写入脚本。"
 
                 if self.task_mgr:
                     # 通过 TaskManager 创建（DB 优先 + 异步推送到沙盒）
                     if not name:
-                        name = command.split("/")[-1] if "/" in command else command[:30]
+                        name = script_name_from_path(normalized_script_path)
                     
                     task = self.task_mgr.create_task(
                         name=name,
                         source="sandbox",
                         cron_expr=cron_expr,
-                        command=command,
-                        description=description or f"由 AI Agent 在 {shlex.quote(command)} 基础上创建"
+                        script_path=normalized_script_path,
+                        description=description or f"由 AI Agent 基于脚本 {shlex.quote(normalized_script_path)} 创建"
                     )
-                    return f"[Cron添加成功] 已成功将以下定时任务写入系统:\n名称: {name}\n规则: {cron_expr}\n命令: {command}"
+                    return f"[Cron添加成功] 已成功将脚本型定时任务写入系统:\n名称: {name}\n规则: {cron_expr}\n脚本: {normalized_script_path}"
                 else:
-                    # 原有逻辑...
-
-                    new_entry = f"{cron_expr} {command}"
+                    new_entry = f"{cron_expr} bash {normalized_script_path}"
                     safe_entry = shlex.quote(new_entry)
                     sh_cmd = f"(crontab -l 2>/dev/null; echo {safe_entry}) | crontab -"
                     res = self._run_multipass(sh_cmd)
                     if "报错" in res:
                         return f"[Cron添加失败] {res}"
-                    return f"[Cron添加成功] 已成功将以下定时任务写入后台系统:\n{new_entry}"
+                    return f"[Cron添加成功] 已成功将脚本型定时任务写入后台系统:\n{new_entry}"
 
             elif action == "delete":
                 task_id = args.get("task_id")
                 if not task_id:
                      # 尝试按命令匹配
-                     cmd_to_del = args.get("command")
-                     if cmd_to_del and self.task_mgr:
+                     script_to_del = args.get("script_path") or args.get("command")
+                     if script_to_del and self.task_mgr:
+                         normalized_script = normalize_script_path(script_to_del) or script_to_del.strip()
                          all_sbox = self.task_mgr.list_tasks(source="sandbox")
                          for t in all_sbox:
-                             if cmd_to_del.strip() in t.command:
+                             if normalized_script == t.script_path:
                                  task_id = t.id
                                  break
                 
                 if not task_id:
-                    return "[参数错误] delete 操作必须提供 'task_id' 或准确的 'command'。"
+                    return "[参数错误] delete 操作必须提供 'task_id' 或准确的 'script_path'。"
 
                 if self.task_mgr:
                     success = self.task_mgr.remove_task(task_id)
@@ -143,7 +147,11 @@ class SandboxCrontabAdmin(BaseTool):
                         },
                         "command": {
                             "type": "string",
-                            "description": "要后台执行的具体系统指令或已赋予 x 权限的脚本绝对路径，仅在 'add' 时须填写"
+                            "description": "兼容字段，仅允许传 /home/ubuntu/.lca/scripts/*.sh 脚本路径"
+                        },
+                        "script_path": {
+                            "type": "string",
+                            "description": "要定时执行的 .sh 脚本路径，必须位于 /home/ubuntu/.lca/scripts/"
                         },
                         "task_name": {
                             "type": "string",

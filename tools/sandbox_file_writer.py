@@ -2,12 +2,20 @@ import json
 import base64
 import subprocess
 import shlex
-import os
 from exquisite_agent.tools.base import BaseTool
+from script_policy import normalize_script_path
 
 class SandboxFileWriter(BaseTool):
     name = "Sandbox_File_Writer"
-    description = "在安全的 Ubuntu 沙盒中创建或覆盖复杂的脚本文件（Python/Bash等）。大段代码、特殊符号都能稳定无损地通过此工具直接写入系统底层，主要配合后续作为执行源。"
+    description = "在 Ubuntu 沙盒中创建或覆盖平台管理的 Shell 脚本。只允许写入 /home/ubuntu/.lca/scripts/*.sh，并会自动做 bash 语法检查。"
+
+    def _normalize_shell_content(self, content: str) -> str:
+        text = (content or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not text.startswith("#!"):
+            text = "#!/usr/bin/env bash\nset -euo pipefail\n\n" + text
+        if not text.endswith("\n"):
+            text += "\n"
+        return text
 
     def execute(self, action_input: str) -> str:
         try:
@@ -21,18 +29,22 @@ class SandboxFileWriter(BaseTool):
             if not file_path or not content:
                 return "[参数缺失] 必须提供 file_path 和 content。"
 
-            # 强制只允许在用户的 home 或 tmp 下写入，并防跳区
-            if ".." in file_path or file_path.startswith("/root"):
-                 return "[安全拦截] 只能在 /home/ubuntu/ 或 /tmp/ 目录下操作文件！"
-                 
-            if not file_path.startswith("/"):
-                 file_path = f"/home/ubuntu/{file_path}"
+            normalized_path = normalize_script_path(file_path)
+            if not normalized_path:
+                 return "[安全拦截] 只允许写入 /home/ubuntu/.lca/scripts/*.sh 脚本文件。"
+            content = self._normalize_shell_content(content)
                  
             # 通过 Base64 中转消除一切各种繁杂语言中引号与特殊符被 Bash 吃掉的情形
             encoded_content = base64.b64encode(content.encode('utf-8')).decode('utf-8')
             
-            # 组合底层多组命令：解码 -> 写入 -> 赋予可执行权限
-            cmd = f"echo '{encoded_content}' | base64 -d > {shlex.quote(file_path)} && chmod +x {shlex.quote(file_path)}"
+            # 解码 -> 语法检查 -> 赋予可执行权限
+            safe_path = shlex.quote(normalized_path)
+            cmd = (
+                "mkdir -p /home/ubuntu/.lca/scripts && "
+                f"echo '{encoded_content}' | base64 -d > {safe_path} && "
+                f"bash -n {safe_path} && "
+                f"chmod +x {safe_path}"
+            )
             
             safe_cmd = shlex.quote(cmd)
             multipass_cmd = f"/usr/local/bin/multipass exec agent-sandbox -- bash -c {safe_cmd}"
@@ -41,9 +53,9 @@ class SandboxFileWriter(BaseTool):
             result = subprocess.run(multipass_cmd, shell=True, capture_output=True, text=True, timeout=10)
             
             if result.returncode != 0:
-                 return f"[写入报错]: {result.stderr.strip()}"
+                 return f"[脚本写入/校验失败]: {result.stderr.strip()}"
             
-            return f"[代码写入成功!] 您已成功在沙盒中创建脚本：{file_path}\n此时您可以通过 Sandbox_Crontab_Admin 或者 Sandbox_Bash_Executor 去调用并执行它了。"
+            return f"[Shell脚本写入成功] 已创建并通过 bash -n 校验：{normalized_path}\n后续可通过 Sandbox_Crontab_Admin 将该脚本挂载为定时任务。"
 
         except Exception as e:
             return f"[异常崩溃] 沙盒写入过程中生致命异常: {str(e)}"
@@ -59,11 +71,11 @@ class SandboxFileWriter(BaseTool):
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "沙盒内文件的绝对路径，推荐放于 /home/ubuntu/xx.py"
+                            "description": "脚本文件名或绝对路径，必须规范化到 /home/ubuntu/.lca/scripts/*.sh"
                         },
                         "content": {
                             "type": "string",
-                            "description": "要吸入的具体代码串或本文，切勿使用 Base64 加密，底层会自动处理"
+                            "description": "Shell 脚本内容，切勿使用 Base64 加密，底层会自动处理"
                         }
                     },
                     "required": ["file_path", "content"]

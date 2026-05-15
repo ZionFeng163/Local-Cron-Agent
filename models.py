@@ -18,7 +18,7 @@ class Task:
     name: str
     source: str              # "internal" | "sandbox"
     cron_expr: str           # cron 表达式，内置任务为 interval 描述
-    command: str             # 执行命令或脚本路径
+    script_path: str         # 沙盒中受平台管理的 .sh 脚本路径
     status: str              # "running" | "paused" | "syncing"
     description: str = ""
     created_at: str = ""
@@ -53,7 +53,7 @@ def init_db():
             name TEXT NOT NULL,
             source TEXT NOT NULL,
             cron_expr TEXT DEFAULT '',
-            command TEXT DEFAULT '',
+            script_path TEXT DEFAULT '',
             status TEXT DEFAULT 'running',
             description TEXT DEFAULT '',
             created_at TEXT DEFAULT '',
@@ -71,6 +71,7 @@ def init_db():
     # 向后兼容迁移：老库没有新增列时补齐
     existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
     alter_specs = {
+        "script_path": "ALTER TABLE tasks ADD COLUMN script_path TEXT DEFAULT ''",
         "monitor_enabled": "ALTER TABLE tasks ADD COLUMN monitor_enabled INTEGER DEFAULT 1",
         "consecutive_failures": "ALTER TABLE tasks ADD COLUMN consecutive_failures INTEGER DEFAULT 0",
         "last_run_at": "ALTER TABLE tasks ADD COLUMN last_run_at TEXT DEFAULT ''",
@@ -81,6 +82,10 @@ def init_db():
     for col, sql in alter_specs.items():
         if col not in existing_cols:
             conn.execute(sql)
+    if "command" in existing_cols and "script_path" in existing_cols:
+        conn.execute(
+            "UPDATE tasks SET script_path = command WHERE source = 'sandbox' AND IFNULL(script_path, '') = ''"
+        )
     conn.execute("""
         CREATE TABLE IF NOT EXISTS task_runs (
             run_id TEXT PRIMARY KEY,
@@ -121,7 +126,7 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         name=row["name"],
         source=row["source"],
         cron_expr=row["cron_expr"],
-        command=row["command"],
+        script_path=row["script_path"] or "",
         status=row["status"],
         description=row["description"] or "",
         created_at=row["created_at"] or "",
@@ -158,7 +163,7 @@ def upsert_task(task: Task):
     conn = _connect()
     conn.execute("""
         INSERT INTO tasks (
-            id, name, source, cron_expr, command, status, description,
+            id, name, source, cron_expr, script_path, status, description,
             created_at, updated_at, last_synced_at,
             monitor_enabled, consecutive_failures, last_run_at,
             last_success_at, last_exit_code, last_auto_heal_at
@@ -167,7 +172,7 @@ def upsert_task(task: Task):
         ON CONFLICT(id) DO UPDATE SET
             name=excluded.name,
             cron_expr=excluded.cron_expr,
-            command=excluded.command,
+            script_path=excluded.script_path,
             status=excluded.status,
             description=excluded.description,
             updated_at=excluded.updated_at,
@@ -179,7 +184,7 @@ def upsert_task(task: Task):
             last_exit_code=excluded.last_exit_code,
             last_auto_heal_at=excluded.last_auto_heal_at
     """, (
-        task.id, task.name, task.source, task.cron_expr, task.command,
+        task.id, task.name, task.source, task.cron_expr, task.script_path,
         task.status, task.description, task.created_at, task.updated_at, task.last_synced_at,
         task.monitor_enabled, task.consecutive_failures, task.last_run_at,
         task.last_success_at, task.last_exit_code, task.last_auto_heal_at

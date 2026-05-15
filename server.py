@@ -420,7 +420,7 @@ def _task_to_dict(t):
         "name": t.name,
         "source": t.source,
         "cron_expr": t.cron_expr,
-        "command": t.command,
+        "script_path": t.script_path,
         "status": t.status.upper(),  # 前端用大写 RUNNING/PAUSED
         "description": t.description,
         "created_at": t.created_at,
@@ -491,7 +491,7 @@ async def toggle_ubuntu(req: ToggleReq):
         all_sandbox = task_mgr.list_tasks(source="sandbox")
         target = None
         for t in all_sandbox:
-            if t.command.strip() in (req.raw_line or ""):
+            if t.script_path.strip() in (req.raw_line or ""):
                 target = t
                 break
         if target:
@@ -525,7 +525,7 @@ async def delete_ubuntu(req: DeleteReq):
     else:
         all_sandbox = task_mgr.list_tasks(source="sandbox")
         for t in all_sandbox:
-            if t.command.strip() in (req.raw_line or ""):
+            if t.script_path.strip() in (req.raw_line or ""):
                 task_mgr.remove_task(t.id)
                 break
     await broadcast_refresh_jobs()

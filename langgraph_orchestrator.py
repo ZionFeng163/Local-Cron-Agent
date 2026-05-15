@@ -18,27 +18,38 @@ from streaming_fc_agent import StreamingFCAgent
 logger = logging.getLogger(__name__)
 
 
+class PlannedStep(BaseModel):
+    step_id: int
+    task: str
+    worker_key: Literal["cron", "script", "ops", "research", "general"]
+    worker_name: str = ""
+    objective: str = ""
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str = ""
+    status: Literal["pending", "running", "completed", "failed"] = "pending"
+    result: str = ""
+
+
+class LeaderPlan(BaseModel):
+    steps: List[PlannedStep]
+
+
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
-    task_list: List[str]
-    current_task_idx: int
+    plan: List[Dict[str, object]]
+    current_step_idx: int
     execution_context: str
+    step_results: List[Dict[str, object]]
     final_answer: str
     run_id: str
 
 
-class RouteDecision(BaseModel):
-    route: Literal["cron", "script", "ops", "research", "general"]
-    confidence: float = Field(ge=0.0, le=1.0)
-    reason: str = ""
-
-
 class LangGraphOrchestrator:
     """
-    Lightweight orchestrator:
-    - Keep the UX of "multi-step execution"
-    - Remove expensive planner/reflector/solver extra LLM calls
-    - Stream tool/content progress from worker in real time
+    LangGraph Leader-Worker orchestrator:
+    - Leader produces a structured worker plan
+    - LangGraph conditional edges dispatch to explicit worker nodes
+    - Workers own domain tools and stream progress in real time
     """
 
     def __init__(self, tools, task_mgr):
@@ -47,9 +58,8 @@ class LangGraphOrchestrator:
         from exquisite_agent.llm import LLM  # local import to keep startup path stable
 
         self.worker_agents = self._build_worker_agents(LLM)
-        self.worker_agent = self.worker_agents["general"]
-        self.router_llm = LLM()
-        self.router_confidence_threshold = 0.6
+        self.leader_llm = LLM()
+        self.worker_confidence_threshold = 0.55
         self.graph = self._build_graph()
 
     def _pick_tools(self, tool_names: List[str]):
@@ -67,13 +77,13 @@ class LangGraphOrchestrator:
                 llm_cls,
                 "CronWorker",
                 ["Sandbox_Crontab_Admin", "Agent_Heartbeat_Controller"],
-                "你是 CronWorker，专注处理定时任务的创建、查询、暂停、恢复和删除。优先使用结构化任务管理工具。",
+                "你是 CronWorker，专注管理脚本型定时任务。只能通过 Sandbox_Crontab_Admin 查询、添加、删除或启停 /home/ubuntu/.lca/scripts/*.sh 脚本任务，禁止创建任意 shell command cron。",
             ),
             "script": self._make_worker(
                 llm_cls,
                 "ScriptWorker",
-                ["Sandbox_File_Writer", "Sandbox_Bash_Executor", "Sandbox_Crontab_Admin"],
-                "你是 ScriptWorker，专注生成、写入、检查脚本，并在需要时将脚本挂载为定时任务。",
+                ["Sandbox_File_Writer", "Sandbox_Bash_Executor"],
+                "你是 ScriptWorker，专注生成、写入和检查 Shell 脚本。必须使用 Sandbox_File_Writer 写入 /home/ubuntu/.lca/scripts/*.sh；不负责挂载 cron。",
             ),
             "ops": self._make_worker(
                 llm_cls,
@@ -91,7 +101,7 @@ class LangGraphOrchestrator:
                 llm_cls,
                 "GeneralWorker",
                 [tool.name for tool in self.tools],
-                "你是 GeneralWorker，负责无法明确归类的综合任务，可以根据需要调用任意可用工具。",
+                "你是 GeneralWorker，负责无法明确归类的综合任务。涉及定时任务时仍必须遵守：只能调度 /home/ubuntu/.lca/scripts/*.sh 脚本。",
             ),
         }
 
@@ -125,7 +135,7 @@ class LangGraphOrchestrator:
         route, score = max(scores.items(), key=lambda item: item[1])
         return route if score > 0 else "general"
 
-    def _extract_route_json_text(self, content: str) -> str:
+    def _extract_json_text(self, content: str) -> str:
         if not content:
             return ""
         text = content.strip()
@@ -141,61 +151,84 @@ class LangGraphOrchestrator:
             return obj_match.group(1)
         return ""
 
-    def _parse_route_decision(self, content: str) -> RouteDecision:
-        json_text = self._extract_route_json_text(content)
+    def _parse_leader_plan(self, content: str) -> LeaderPlan:
+        json_text = self._extract_json_text(content)
         if not json_text:
-            raise ValueError("empty route json")
-        return RouteDecision.model_validate_json(json_text)
+            raise ValueError("empty leader plan json")
+        return LeaderPlan.model_validate_json(json_text)
 
-    def _llm_route_task(self, task: str, execution_context: str = "") -> Dict[str, object]:
-        allowed_routes = {"cron", "script", "ops", "research", "general"}
-        fallback = self._route_task_rule(task)
-        short_ctx = (execution_context or "")[-800:]
+    def _worker_name(self, worker_key: str) -> str:
+        worker = self.worker_agents.get(worker_key, self.worker_agents["general"])
+        return worker.name
 
-        sys_prompt = (
-            "你是一个任务路由器。"
-            "只做分类，不执行任务。"
-            "你必须严格输出 JSON，不要输出任何额外文本。"
-            "可选 route 仅限: cron, script, ops, research, general。"
-            "输出格式: {\"route\":\"...\",\"confidence\":0-1,\"reason\":\"...\"}。"
-            "若信息不足，请选择 general。"
-            "优先最小能力匹配。"
-        )
-        user_prompt = (
-            f"任务: {task}\n"
-            f"最近上下文(可能为空): {short_ctx}\n"
-            "请返回 JSON。"
-        )
-        try:
-            resp = self.router_llm.chat(
-                [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
-                []
-            )
-            decision = self._parse_route_decision(getattr(resp, "content", "") or "")
-            route = decision.route
-            confidence = decision.confidence
-            reason = decision.reason.strip()
+    def _normalize_plan(self, plan: LeaderPlan) -> List[Dict[str, object]]:
+        normalized = []
+        for idx, step in enumerate(plan.steps[:5], start=1):
+            data = step.model_dump()
+            worker_key = str(data.get("worker_key") or "general")
+            if worker_key not in self.worker_agents or float(data.get("confidence") or 0) < self.worker_confidence_threshold:
+                worker_key = "general"
+            data["step_id"] = idx
+            data["worker_key"] = worker_key
+            data["worker_name"] = self._worker_name(worker_key)
+            data["status"] = "pending"
+            data["result"] = ""
+            normalized.append(data)
+        return normalized or self._fallback_plan("执行用户请求")
 
-            if route not in allowed_routes or confidence < self.router_confidence_threshold:
-                return {
-                    "route": fallback,
-                    "confidence": confidence,
-                    "reason": reason or "llm_confidence_low_or_invalid_route",
-                    "source": "fallback_rule",
+    def _fallback_plan(self, user_input: str) -> List[Dict[str, object]]:
+        text = user_input.strip() or "执行用户请求"
+        normalized_text = text
+        for sep in ["然后", "接着", "并且", "再", ";", "；", "\n"]:
+            normalized_text = normalized_text.replace(sep, "。")
+        parts = [p.strip() for p in re.split(r"[。.!?]", normalized_text) if p.strip()] or [text]
+
+        steps = []
+        for idx, part in enumerate(parts[:5], start=1):
+            worker_key = self._route_task_rule(part)
+            steps.append(
+                {
+                    "step_id": idx,
+                    "task": part,
+                    "worker_key": worker_key,
+                    "worker_name": self._worker_name(worker_key),
+                    "objective": part,
+                    "confidence": 0.6,
+                    "reason": "fallback_rule",
+                    "status": "pending",
+                    "result": "",
                 }
-            return {
-                "route": route,
-                "confidence": confidence,
-                "reason": reason,
-                "source": "llm",
-            }
+            )
+        return steps
+
+    def _leader_plan(self, user_input: str) -> List[Dict[str, object]]:
+        sys_prompt = """
+你是 Local-Cron-Agent 的 Leader Agent，只负责规划和分派，不执行工具。
+请把用户请求拆成 1-5 个可执行步骤，并为每步指定 worker_key。
+worker_key 只能是:
+- script: 生成、写入、检查 /home/ubuntu/.lca/scripts/*.sh 脚本
+- cron: 查询、添加、删除、启停脚本型 cron 任务
+- ops: 系统巡检、服务管理、即时诊断和恢复
+- research: 外部资料检索
+- general: 信息不足或混合任务兜底
+
+重要约束:
+- 沙盒定时任务只能调度 /home/ubuntu/.lca/scripts/*.sh。
+- 如果用户要“写脚本并定时运行”，必须拆成 script 步骤和 cron 步骤。
+- 只输出 JSON，不要输出任何额外文本。
+输出格式:
+{"steps":[{"step_id":1,"task":"...","worker_key":"script","worker_name":"ScriptWorker","objective":"...","confidence":0.9,"reason":"..."}]}
+""".strip()
+        user_prompt = f"用户请求: {user_input}\n请输出结构化执行计划。"
+        try:
+            resp = self.leader_llm.chat(
+                [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
+                [],
+            )
+            return self._normalize_plan(self._parse_leader_plan(getattr(resp, "content", "") or ""))
         except Exception as e:
-            return {
-                "route": fallback,
-                "confidence": 0.0,
-                "reason": f"llm_route_exception: {e}",
-                "source": "fallback_rule",
-            }
+            logger.warning("Leader plan fallback: %s", e)
+            return self._fallback_plan(user_input)
 
     def _get_worker(self, route: str) -> StreamingFCAgent:
         return self.worker_agents.get(route, self.worker_agents["general"])
@@ -210,187 +243,186 @@ class LangGraphOrchestrator:
         if cb:
             cb({"type": "status", "content": content})
 
-    def _build_plan(self, user_input: str) -> List[str]:
-        """
-        Cheap rule-based planner to avoid extra LLM round trip + token cost.
-        """
-        text = user_input.strip()
-        if not text:
-            return ["执行用户请求"]
-
-        # Normalize common separators for CN/EN mixed text.
-        normalized = text
-        for sep in ["然后", "接着", "并且", "再", ";", "；", "\n"]:
-            normalized = normalized.replace(sep, "。")
-
-        parts = [p.strip() for p in re.split(r"[。.!?]", normalized) if p.strip()]
-        if not parts:
-            return [text]
-
-        # Limit step count to keep latency controlled.
-        steps = parts[:3]
-        return steps
-
     def _build_graph(self):
         builder = StateGraph(AgentState)
-        builder.add_node("planner", self.planner_node)
-        builder.add_node("executor", self.executor_node)
+        builder.add_node("leader", self.leader_node)
+        builder.add_node("cron_worker", self._make_worker_node("cron"))
+        builder.add_node("script_worker", self._make_worker_node("script"))
+        builder.add_node("ops_worker", self._make_worker_node("ops"))
+        builder.add_node("research_worker", self._make_worker_node("research"))
+        builder.add_node("general_worker", self._make_worker_node("general"))
         builder.add_node("solver", self.solver_node)
 
-        builder.add_edge(START, "planner")
-        builder.add_edge("planner", "executor")
-        builder.add_conditional_edges(
-            "executor",
-            self.should_continue_executing,
-            {"next": "executor", "done": "solver"},
-        )
+        worker_edges = {
+            "cron": "cron_worker",
+            "script": "script_worker",
+            "ops": "ops_worker",
+            "research": "research_worker",
+            "general": "general_worker",
+            "done": "solver",
+        }
+
+        builder.add_edge(START, "leader")
+        builder.add_conditional_edges("leader", self.dispatch_next_worker, worker_edges)
+        for node_name in ["cron_worker", "script_worker", "ops_worker", "research_worker", "general_worker"]:
+            builder.add_conditional_edges(node_name, self.dispatch_next_worker, worker_edges)
         builder.add_edge("solver", END)
         return builder.compile()
 
-    def planner_node(self, state: AgentState, config: Optional[RunnableConfig] = None):
-        logger.info("--- PLANNER ---")
+    def leader_node(self, state: AgentState, config: Optional[RunnableConfig] = None):
+        logger.info("--- LEADER ---")
         cb = self._extract_callback(config)
         user_input = state["messages"][0].content
-        task_list = self._build_plan(user_input)
+        plan = self._leader_plan(user_input)
         redis_state.set_run_status(
             state["run_id"],
-            {"status": "planned", "total_steps": len(task_list), "current_step": 0},
+            {"status": "planned", "total_steps": len(plan), "current_step": 0, "plan": plan},
         )
-        self._emit_status(cb, f"🧭 已规划 {len(task_list)} 个步骤，开始执行。")
+        plan_lines = [f"{step['step_id']}. {step['worker_name']}: {step['task']}" for step in plan]
+        self._emit_status(cb, "🧭 Leader 已生成执行计划：\n" + "\n".join(plan_lines))
         return {
-            "task_list": task_list,
-            "current_task_idx": 0,
+            "plan": plan,
+            "current_step_idx": 0,
             "execution_context": "",
-            "messages": [AIMessage(content=f"🏗️ [任务规划] 共 {len(task_list)} 步")],
+            "step_results": [],
+            "messages": [AIMessage(content=f"🏗️ [Leader 规划] 共 {len(plan)} 步")],
         }
 
-    def executor_node(self, state: AgentState, config: Optional[RunnableConfig] = None):
-        idx = state["current_task_idx"]
-        task = state["task_list"][idx]
-        logger.info(f"--- EXECUTOR {idx + 1} ---")
+    def _make_worker_node(self, worker_key: str):
+        def worker_node(state: AgentState, config: Optional[RunnableConfig] = None):
+            idx = state["current_step_idx"]
+            plan = list(state["plan"])
+            step = dict(plan[idx])
+            worker = self.worker_agents.get(worker_key, self.worker_agents["general"])
+            cb = self._extract_callback(config)
+            task = str(step.get("task") or "")
+            objective = str(step.get("objective") or task)
+            context = (state.get("execution_context") or "")[-1600:]
 
-        cb = self._extract_callback(config)
-        route_info = self._llm_route_task(task, state.get("execution_context", ""))
-        route = str(route_info.get("route", "general"))
-        worker = self._get_worker(route)
-        redis_state.set_run_status(
-            state["run_id"],
-            {
-                "status": "running",
-                "current_step": idx + 1,
-                "total_steps": len(state["task_list"]),
-                "route": route,
-                "route_source": route_info.get("source", "unknown"),
-                "route_confidence": route_info.get("confidence", 0),
-                "route_reason": route_info.get("reason", ""),
-                "worker": worker.name,
-                "task": task,
-            },
-        )
-        self._emit_status(cb, f"🚀 步骤 {idx + 1}/{len(state['task_list'])}: {task}")
-        self._emit_status(
-            cb,
-            f"🧩 已路由至 {worker.name} (source={route_info.get('source')}, conf={route_info.get('confidence', 0):.2f})",
-        )
+            logger.info("--- %s STEP %s ---", worker.name, idx + 1)
+            step["status"] = "running"
+            plan[idx] = step
+            redis_state.set_run_status(
+                state["run_id"],
+                {
+                    "status": "worker_running",
+                    "current_step": idx + 1,
+                    "total_steps": len(plan),
+                    "worker": worker.name,
+                    "worker_key": worker_key,
+                    "task": task,
+                    "objective": objective,
+                },
+            )
+            self._emit_status(cb, f"🚀 步骤 {idx + 1}/{len(plan)} 交给 {worker.name}: {task}")
 
-        executor_res = ""
-        for chunk in worker.run_stream(task):
-            if cb:
-                cb(chunk)
-            if chunk.get("type") == "content_chunk":
-                executor_res += chunk["content"]
+            worker_prompt = (
+                f"当前步骤: {task}\n"
+                f"步骤目标: {objective}\n"
+                f"Leader 分派原因: {step.get('reason', '')}\n"
+                f"历史执行上下文:\n{context}\n\n"
+                "请只完成当前步骤。涉及定时任务时，必须使用 /home/ubuntu/.lca/scripts/*.sh 脚本路径。"
+            )
 
-        # Keep context bounded to avoid growth.
-        compact_res = executor_res.strip()
-        if len(compact_res) > 800:
-            compact_res = compact_res[:800] + "..."
-        new_context = state["execution_context"] + f"\n[步骤 {idx + 1}] {task}\n结果: {compact_res}\n"
-        if len(new_context) > 2400:
-            new_context = new_context[-2400:]
-        redis_state.set_run_status(
-            state["run_id"],
-            {
-                "status": "step_completed",
-                "current_step": idx + 1,
-                "total_steps": len(state["task_list"]),
-                "route": route,
-                "worker": worker.name,
-                "task": task,
-            },
-        )
+            result_parts = []
+            try:
+                for chunk in worker.run_stream(worker_prompt):
+                    if cb:
+                        cb(chunk)
+                    if chunk.get("type") in {"content_chunk", "message", "tool_result"}:
+                        content = chunk.get("content", "")
+                        if content:
+                            result_parts.append(content)
+                result = "\n".join(result_parts).strip()
+                step["status"] = "completed"
+                step["result"] = result
+            except Exception as exc:  # noqa: BLE001
+                result = f"[Worker执行异常] {exc}"
+                step["status"] = "failed"
+                step["result"] = result
+                self._emit_status(cb, result)
 
-        if self.task_mgr:
-            self.task_mgr.sync_internal_tasks()
-            # Run sandbox sync async to avoid blocking stream.
-            threading.Thread(target=self.task_mgr.sync_sandbox_tasks, daemon=True).start()
+            plan[idx] = step
+            compact_result = result[:900] + "..." if len(result) > 900 else result
+            new_context = (
+                (state.get("execution_context") or "")
+                + f"\n[步骤 {idx + 1}][{worker.name}] {task}\n结果: {compact_result}\n"
+            )[-3000:]
+            step_results = list(state.get("step_results") or [])
+            step_results.append(
+                {
+                    "step_id": step.get("step_id", idx + 1),
+                    "worker": worker.name,
+                    "task": task,
+                    "status": step["status"],
+                    "result": compact_result,
+                }
+            )
+            redis_state.set_run_status(
+                state["run_id"],
+                {
+                    "status": "step_completed",
+                    "current_step": idx + 1,
+                    "total_steps": len(plan),
+                    "worker": worker.name,
+                    "task": task,
+                    "step_status": step["status"],
+                },
+            )
 
-        return {
-            "execution_context": new_context,
-            "current_task_idx": idx + 1,
-            "messages": [AIMessage(content=f"⚙️ [步骤 {idx + 1} 完成]")],
-        }
+            if self.task_mgr:
+                self.task_mgr.sync_internal_tasks()
+                threading.Thread(target=self.task_mgr.sync_sandbox_tasks, daemon=True).start()
+
+            return {
+                "plan": plan,
+                "execution_context": new_context,
+                "step_results": step_results,
+                "current_step_idx": idx + 1,
+                "messages": [AIMessage(content=f"⚙️ [{worker.name} 步骤 {idx + 1} 完成]")],
+            }
+
+        return worker_node
 
     def solver_node(self, state: AgentState, config: Optional[RunnableConfig] = None):
         logger.info("--- SOLVER ---")
         cb = self._extract_callback(config)
-        redis_state.set_run_status(state["run_id"], {"status": "completed"})
+        results = state.get("step_results") or []
+        lines = []
+        for item in results:
+            status_text = "完成" if item.get("status") == "completed" else "失败"
+            lines.append(f"- [{status_text}] {item.get('worker')}: {item.get('task')}")
+        final_answer = "✅ 多 Agent Leader-Worker 执行完成。"
+        if lines:
+            final_answer += "\n" + "\n".join(lines)
+        redis_state.set_run_status(state["run_id"], {"status": "completed", "results": results})
         self._emit_status(cb, "📝 正在收尾并返回结果...")
         return {
-            "final_answer": "✅ 多步骤任务执行完成。",
-            "messages": [AIMessage(content="✅ 多步骤任务执行完成。")],
+            "final_answer": final_answer,
+            "messages": [AIMessage(content=final_answer)],
         }
 
-    def should_continue_executing(self, state: AgentState):
-        if state["current_task_idx"] < len(state["task_list"]):
-            return "next"
-        return "done"
+    def dispatch_next_worker(self, state: AgentState):
+        idx = state.get("current_step_idx", 0)
+        plan = state.get("plan") or []
+        if idx >= len(plan):
+            return "done"
+        step = plan[idx]
+        worker_key = str(step.get("worker_key") or "general")
+        if worker_key not in self.worker_agents:
+            return "general"
+        return worker_key
 
     def run_stream(self, user_input: str, callback: callable = None, run_id: str = ""):
         run_id = run_id or f"run-{uuid.uuid4().hex[:12]}"
         redis_state.set_run_status(run_id, {"status": "received", "input": user_input[:500]})
-        # Fast-track for short instructions
-        if len(user_input.strip()) < 25:
-            logger.info(">>> Fast-Track Triggered: Skipping LangGraph Planning <<<")
-            route_info = self._llm_route_task(user_input, "")
-            route = str(route_info.get("route", "general"))
-            worker = self._get_worker(route)
-            redis_state.set_run_status(
-                run_id,
-                {
-                    "status": "running",
-                    "route": route,
-                    "route_source": route_info.get("source", "unknown"),
-                    "route_confidence": route_info.get("confidence", 0),
-                    "route_reason": route_info.get("reason", ""),
-                    "worker": worker.name,
-                    "input": user_input[:500],
-                },
-            )
-            if callback:
-                callback(
-                    {
-                        "type": "status",
-                        "content": (
-                            f"🧩 已路由至 {worker.name} "
-                            f"(source={route_info.get('source')}, conf={route_info.get('confidence', 0):.2f})"
-                        ),
-                    }
-                )
-            for chunk in worker.run_stream(user_input):
-                yield chunk
-            if self.task_mgr:
-                self.task_mgr.sync_internal_tasks()
-                threading.Thread(target=self.task_mgr.sync_sandbox_tasks, daemon=True).start()
-            redis_state.set_run_status(run_id, {"status": "completed", "route": route, "worker": worker.name})
-            yield {"type": "message", "content": "✅ 指令已快速执行完毕。"}
-            return
-
-        logger.info(">>> LangGraph Orchestration Triggered: Complex Mode <<<")
+        logger.info(">>> LangGraph Leader-Worker Orchestration Triggered <<<")
         initial_state = {
             "messages": [HumanMessage(content=user_input)],
-            "task_list": [],
-            "current_task_idx": 0,
+            "plan": [],
+            "current_step_idx": 0,
             "execution_context": "",
+            "step_results": [],
             "final_answer": "",
             "run_id": run_id,
         }

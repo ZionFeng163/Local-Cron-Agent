@@ -23,7 +23,7 @@ const toggleTask = async (event, job) => {
 
 const deleteTask = async (event, job) => {
   event.stopPropagation() // 防止触发行点击
-  if (!confirm(`确定要永久删除此任务吗？\n${job.command || job.name}`)) return
+  if (!confirm(`确定要永久删除此任务吗？\n${job.script_path || job.name}`)) return
   try {
     await fetch('http://localhost:8000/api/jobs/delete', {
       method: 'POST',
@@ -69,7 +69,7 @@ const fmtExitCode = (v) => (v === null || v === undefined ? '---' : String(v))
   <div class="view-container">
     <div class="view-header">
       <h2>任务管理</h2>
-      <p class="view-subtitle">查看、暂停、启动或删除所有定时任务</p>
+      <p class="view-subtitle">查看、暂停、启动或删除脚本型定时任务</p>
     </div>
 
     <div class="table-section">
@@ -105,7 +105,7 @@ const fmtExitCode = (v) => (v === null || v === undefined ? '---' : String(v))
     </div>
 
     <div class="table-section">
-      <h3 class="table-title">沙盒 Crontab 任务</h3>
+      <h3 class="table-title">沙盒脚本定时任务</h3>
       <table class="data-table">
         <thead>
           <tr>
@@ -125,7 +125,7 @@ const fmtExitCode = (v) => (v === null || v === undefined ? '---' : String(v))
           <template v-else>
             <tr v-for="job in ubuntuJobs" :key="job.id" class="clickable-row" @click="emit('showDetail', job)">
               <td>{{ job.name || '未命名任务' }}</td>
-              <td class="desc-cell">{{ job.description || job.command }}</td>
+              <td class="desc-cell">{{ job.description || job.script_path }}</td>
               <td>
                 <span :class="['status-badge', job.status === 'RUNNING' ? 'badge-running status-live' : 'badge-paused']">
                   <span v-if="job.status === 'RUNNING'" class="live-dot"></span>
@@ -197,4 +197,3 @@ const fmtExitCode = (v) => (v === null || v === undefined ? '---' : String(v))
   100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
 }
 </style>
-

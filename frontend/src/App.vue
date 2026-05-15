@@ -42,7 +42,7 @@ const refreshAll = async () => {
 
 // ========== 聊天状态 ==========
 const chatMessages = ref([
-  { role: 'agent', content: '您好，长官！我是您的 Local-Cron-Agent。很高兴为您服务。通过在下面打字，您可以让我暂停/拉起任何定时任务，或清理宿主机。' }
+  { role: 'agent', content: '您好，长官！我是您的 Local-Cron-Agent。很高兴为您服务。通过在下面打字，您可以让我生成脚本型定时任务、暂停/拉起任务，或检查沙盒状态。' }
 ])
 
 const thinkingHints = [
@@ -258,7 +258,7 @@ onUnmounted(() => {
               </div>
               <div class="detail-item">
                 <span class="detail-label">来源</span>
-                <span class="detail-value badge-source">{{ selectedTask.source === 'internal' ? 'Agent 内置' : '沙盒 Crontab' }}</span>
+                <span class="detail-value badge-source">{{ selectedTask.source === 'internal' ? 'Agent 内置' : '沙盒脚本任务' }}</span>
               </div>
               <div class="detail-item">
                 <span class="detail-label">状态</span>
@@ -271,8 +271,8 @@ onUnmounted(() => {
                 <span class="detail-value mono">{{ selectedTask.cron_expr }}</span>
               </div>
               <div class="detail-item full-width">
-                <span class="detail-label">执行命令</span>
-                <div class="detail-value command-box">{{ selectedTask.command }}</div>
+                <span class="detail-label">脚本路径</span>
+                <div class="detail-value command-box">{{ selectedTask.script_path || '---' }}</div>
               </div>
               <div class="detail-item full-width">
                 <span class="detail-label">详细描述</span>

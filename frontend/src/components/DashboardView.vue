@@ -82,12 +82,12 @@ defineExpose({ fetchData })
         </div>
       </div>
       <div class="section-card">
-        <h3>🐧 沙盒定时任务</h3>
+        <h3>🐧 沙盒脚本任务</h3>
         <div v-if="ubuntuLoading" class="empty-small">⏳ 正在连接沙盒虚拟机...</div>
         <template v-else>
-          <div v-if="ubuntuJobs.length === 0" class="empty-small">沙盒没有配置定时任务</div>
+          <div v-if="ubuntuJobs.length === 0" class="empty-small">沙盒没有配置脚本型定时任务</div>
           <div v-for="job in ubuntuJobs" :key="job.id" class="mini-job" @click="emit('showDetail', job)">
-            <span class="mini-name">{{ job.name || job.command.split(' ').slice(0,3).join(' ') + '...' }}</span>
+            <span class="mini-name">{{ job.name || job.script_path?.split('/').pop() || '脚本任务' }}</span>
             <span :class="['status-badge', job.status === 'RUNNING' ? 'badge-running' : 'badge-paused']">
               {{ job.status === 'RUNNING' ? '运行中' : '已暂停' }}
             </span>

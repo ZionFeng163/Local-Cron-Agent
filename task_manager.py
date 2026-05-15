@@ -20,6 +20,7 @@ from models import (
     get_task_heal_records, count_task_heal_records
 )
 from redis_state import redis_state
+from script_policy import normalize_script_path, render_script_command, script_name_from_path
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +47,18 @@ class TaskManager:
 
     # ==================== 写操作（DB 优先 + 异步推送）====================
 
-    def create_task(self, name: str, source: str, cron_expr: str, command: str,
+    def create_task(self, name: str, source: str, cron_expr: str, script_path: str,
                     description: str = "", status: str = "running") -> Task:
         """创建任务：先写 DB，再异步推送到执行环境"""
+        normalized_script_path = script_path
+        if source == "sandbox":
+            normalized_script_path = normalize_script_path(script_path) or ""
+            if not normalized_script_path:
+                raise ValueError("sandbox task must use /home/ubuntu/.lca/scripts/*.sh")
+
         task = Task(
             id=gen_id(), name=name, source=source,
-            cron_expr=cron_expr, command=command,
+            cron_expr=cron_expr, script_path=normalized_script_path,
             status=status, description=description,
             created_at=_now(), updated_at=_now(), last_synced_at="",
             monitor_enabled=1, consecutive_failures=0,
@@ -125,7 +132,7 @@ class TaskManager:
                 name="内置系统体检心跳",
                 source="internal",
                 cron_expr="interval 3600s",
-                command="system_check_job",
+                script_path="",
                 status=status,
                 description="每小时自动巡检沙盒健康状态",
                 created_at=existing.created_at if existing else _now(),
@@ -208,20 +215,24 @@ class TaskManager:
                 cron_expr = "???"
                 command_part = display_line
 
-            parsed = self._extract_command_and_task_id(command_part)
+            parsed = self._extract_script_path_and_task_id(command_part)
+            if not parsed.get("script_path"):
+                logger.info("跳过非新版脚本型 crontab: %s", line)
+                continue
+
             sandbox_tasks_from_cron.append({
                 "cron_expr": cron_expr,
-                "command": parsed["command"],
+                "script_path": parsed["script_path"],
                 "task_id_hint": parsed.get("task_id"),
                 "status": "paused" if is_paused else "running",
                 "raw": line
             })
 
         db_sandbox_tasks = get_all_tasks(source="sandbox")
-        db_cmd_map = {t.command.strip(): t for t in db_sandbox_tasks}
+        db_script_map = {t.script_path.strip(): t for t in db_sandbox_tasks}
 
         for ct in sandbox_tasks_from_cron:
-            cmd_key = ct["command"].strip()
+            script_key = ct["script_path"].strip()
             matched = None
 
             if ct.get("task_id_hint"):
@@ -229,8 +240,8 @@ class TaskManager:
                 if matched and matched.source != "sandbox":
                     matched = None
 
-            if not matched and cmd_key in db_cmd_map:
-                matched = db_cmd_map[cmd_key]
+            if not matched and script_key in db_script_map:
+                matched = db_script_map[script_key]
 
             if matched:
                 matched.cron_expr = ct["cron_expr"]
@@ -238,15 +249,15 @@ class TaskManager:
                 matched.last_synced_at = _now()
                 matched.updated_at = _now()
                 upsert_task(matched)
-                db_cmd_map.pop(matched.command.strip(), None)
+                db_script_map.pop(matched.script_path.strip(), None)
             else:
                 new_task_id = ct.get("task_id_hint") or gen_id()
                 task = Task(
                     id=new_task_id,
-                    name=cmd_key.split("/")[-1] if "/" in cmd_key else cmd_key[:30],
+                    name=script_name_from_path(script_key),
                     source="sandbox",
                     cron_expr=ct["cron_expr"],
-                    command=ct["command"],
+                    script_path=script_key,
                     status=ct["status"],
                     description="从沙盒 crontab 自动导入",
                     created_at=_now(),
@@ -262,7 +273,7 @@ class TaskManager:
                 upsert_task(task)
                 logger.info(f"📥 从沙盒导入新任务: {task.name}")
 
-        for orphan in db_cmd_map.values():
+        for orphan in db_script_map.values():
             # 不再因为单次同步差异就直接删库，避免“任务一闪而过”
             # 典型场景：异步推送尚未完成、沙盒短暂不可达、crontab 读取瞬时失败
             logger.warning(f"⚠️ 沙盒未匹配到任务，先保留DB记录: {orphan.name} ({orphan.id})")
@@ -280,11 +291,10 @@ class TaskManager:
         )
 
     def _ensure_runlog_dir(self):
-        self._run_sandbox("mkdir -p /home/ubuntu/.lca && touch /home/ubuntu/.lca/task_runs.log", timeout=10)
+        self._run_sandbox("mkdir -p /home/ubuntu/.lca/scripts && touch /home/ubuntu/.lca/task_runs.log", timeout=10)
 
     def _build_wrapped_command(self, task: Task) -> str:
-        """简化实现：保持 cron 原始命令，不做复杂包装。"""
-        return task.command
+        return render_script_command(task.script_path)
 
     def _render_cron_entry(self, task: Task) -> str:
         command = self._build_wrapped_command(task)
@@ -293,9 +303,10 @@ class TaskManager:
             return f"#⏸️ {entry}"
         return entry
 
-    def _extract_command_and_task_id(self, command_part: str) -> Dict[str, Any]:
+    def _extract_script_path_and_task_id(self, command_part: str) -> Dict[str, Any]:
         task_id = None
-        command = command_part
+        script_path = ""
+        command = command_part.strip()
         marker = "#LCA_TASK_ID="
         if marker in command_part:
             before, after = command_part.split(marker, 1)
@@ -304,7 +315,16 @@ class TaskManager:
             if hint:
                 task_id = hint
 
-        return {"command": command, "task_id": task_id}
+        try:
+            parts = shlex.split(command)
+        except Exception:
+            parts = []
+        if len(parts) == 2 and parts[0] == "bash":
+            script_path = normalize_script_path(parts[1]) or ""
+        else:
+            script_path = normalize_script_path(command) or ""
+
+        return {"script_path": script_path, "task_id": task_id}
 
 
     def _sync_push_sandbox_add(self, task: Task):
@@ -473,7 +493,7 @@ echo "$TOTAL" > {self.run_log_state_file}
             return None
 
         try:
-            result = self._run_sandbox(task.command, timeout=60, capture_output=True)
+            result = self._run_sandbox(render_script_command(task.script_path), timeout=60, capture_output=True)
             exit_code = result.returncode
             now_ts = _now()
             output_tail = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()[:500]
@@ -518,26 +538,8 @@ echo "$TOTAL" > {self.run_log_state_file}
             return "transient_network"
         return "unknown"
 
-    def _extract_safe_exec_path(self, command: str) -> Optional[str]:
-        try:
-            parts = shlex.split(command)
-        except Exception:
-            return None
-
-        if not parts:
-            return None
-
-        candidate = parts[0]
-        if candidate in {"bash", "sh"} and len(parts) > 1:
-            candidate = parts[1]
-
-        if not candidate.startswith("/"):
-            return None
-        if not candidate.startswith("/home/ubuntu/"):
-            return None
-        if any(ch in candidate for ch in ["|", ";", "&", "`", "$", "<", ">", "(", ")"]):
-            return None
-        return candidate
+    def _extract_safe_exec_path(self, script_path: str) -> Optional[str]:
+        return normalize_script_path(script_path)
 
     def _run_heal_action(self, task: Task, category: str) -> Dict[str, Any]:
         if category == "command_missing":
@@ -549,7 +551,7 @@ echo "$TOTAL" > {self.run_log_state_file}
             }
 
         if category == "permission_error":
-            target = self._extract_safe_exec_path(task.command)
+            target = self._extract_safe_exec_path(task.script_path)
             if not target:
                 return {
                     "action": "skip_unsafe_chmod",
@@ -712,7 +714,7 @@ echo "$TOTAL" > {self.run_log_state_file}
             }
 
         try:
-            result = self._run_sandbox(task.command, timeout=60, capture_output=True)
+            result = self._run_sandbox(render_script_command(task.script_path), timeout=60, capture_output=True)
             exit_code = result.returncode
             now_ts = _now()
             output_tail = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()[:500]
