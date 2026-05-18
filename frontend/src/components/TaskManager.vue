@@ -36,6 +36,19 @@ const deleteTask = async (event, job) => {
 
 const healTask = async (event, job) => {
   event.stopPropagation()
+  if (!job.needs_repair) {
+    alert('当前任务最近一次执行正常，无需修复。')
+    return
+  }
+  if (job.status === 'RUNNING' && job.needs_repair) {
+    const ok = confirm(
+      `将对「${job.name || job.script_path || job.id}」执行一次诊断试跑。\n\n` +
+      '如果脚本仍然返回非 0，系统会暂停调度，避免它继续按 cron 反复失败。\n\n' +
+      '是否继续？'
+    )
+    if (!ok) return
+  }
+
   try {
     const res = await fetch(`http://localhost:8000/api/tasks/${job.id}/heal`, {
       method: 'POST',
@@ -46,11 +59,22 @@ const healTask = async (event, job) => {
     if (!res.ok) throw new Error(data?.detail || '修复请求失败')
 
     const result = data?.result || {}
-    const lines = [result.msg || '已触发修复']
-    if (result.category) lines.push(`失败类型: ${result.category}`)
-    if (result.action) lines.push(`动作: ${result.action}`)
-    if (result.exit_code !== undefined && result.exit_code !== null) lines.push(`退出码: ${result.exit_code}`)
-    if (result.failures !== undefined && result.failures !== null) lines.push(`连续失败: ${result.failures}`)
+    const title = result.ok ? '修复结果：成功' : '修复结果：未成功'
+    const lines = [
+      title,
+      result.summary || result.msg || '修复流程已结束'
+    ]
+    if (result.schedule_changed) {
+      lines.push(`调度变化: 已变为「${result.schedule_label || '未知'}」`)
+    } else if (result.schedule_label) {
+      lines.push(`当前调度: ${result.schedule_label}`)
+    }
+    if (result.exit_code !== undefined && result.exit_code !== null) lines.push(`本次试跑退出码: ${result.exit_code}`)
+    if (result.failures !== undefined && result.failures !== null) lines.push(`连续失败次数: ${result.failures}`)
+    if (result.next_step) lines.push(`下一步: ${result.next_step}`)
+    if (result.category || result.action) {
+      lines.push(`诊断明细: ${result.category || 'unknown'} / ${result.action || 'unknown'}`)
+    }
     alert(lines.join('\n'))
 
     emit('refresh')
@@ -61,6 +85,22 @@ const healTask = async (event, job) => {
 }
 
 const fmtExitCode = (v) => (v === null || v === undefined ? '---' : String(v))
+const scheduleLabel = (job) => job.schedule_label || (job.status === 'RUNNING' ? '调度中' : '已暂停')
+const healthLabel = (job) => job.health_label || '未检测'
+const healthBadgeClass = (job) => {
+  if (job.health_status === 'HEALTHY') return 'badge-running'
+  if (job.health_status === 'FAILING') return 'badge-failing'
+  return 'badge-unknown'
+}
+const scheduleBadgeClass = (job) => {
+  if (job.status !== 'RUNNING') return 'badge-paused'
+  if (job.health_status === 'FAILING') return 'badge-failing'
+  return 'badge-running'
+}
+const scheduleDisplayLabel = (job) => {
+  if (job.status === 'RUNNING' && job.health_status === 'FAILING') return '异常调度中'
+  return scheduleLabel(job)
+}
 </script>
 
 <template>
@@ -108,27 +148,31 @@ const fmtExitCode = (v) => (v === null || v === undefined ? '---' : String(v))
         <thead>
           <tr>
             <th style="width: 18%">任务名称</th>
-            <th style="width: 26%">详细描述</th>
-            <th style="width: 9%">状态</th>
-            <th style="width: 10%">连续失败</th>
+            <th style="width: 23%">详细描述</th>
+            <th style="width: 9%">调度</th>
+            <th style="width: 9%">健康</th>
+            <th style="width: 9%">连续失败</th>
             <th style="width: 14%">最近成功</th>
             <th style="width: 8%">退出码</th>
-            <th style="width: 15%">操作</th>
+            <th style="width: 19%">操作</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="ubuntuLoading">
-            <td colspan="7" class="empty-row">⏳ 首次同步中...</td>
+            <td colspan="8" class="empty-row">⏳ 首次同步中...</td>
           </tr>
           <template v-else>
             <tr v-for="job in ubuntuJobs" :key="job.id" class="clickable-row" @click="emit('showDetail', job)">
               <td>{{ job.name || '未命名任务' }}</td>
               <td class="desc-cell">{{ job.description || job.script_path }}</td>
               <td>
-                <span :class="['status-badge', job.status === 'RUNNING' ? 'badge-running status-live' : 'badge-paused']">
+                <span :class="['status-badge', scheduleBadgeClass(job), job.status === 'RUNNING' ? 'status-live' : '']" :title="job.status_explanation">
                   <span v-if="job.status === 'RUNNING'" class="live-dot"></span>
-                  {{ job.status === 'RUNNING' ? '运行中' : '已暂停' }}
+                  {{ scheduleDisplayLabel(job) }}
                 </span>
+              </td>
+              <td>
+                <span :class="['status-badge', healthBadgeClass(job)]" :title="job.status_explanation">{{ healthLabel(job) }}</span>
               </td>
               <td class="mono">{{ job.consecutive_failures ?? 0 }}</td>
               <td class="mono">{{ job.last_success_at || '---' }}</td>
@@ -137,12 +181,19 @@ const fmtExitCode = (v) => (v === null || v === undefined ? '---' : String(v))
                 <button @click="toggleTask($event, job)" :class="['table-btn', job.status === 'RUNNING' ? 'btn-danger' : 'btn-success']">
                   {{ job.status === 'RUNNING' ? '暂停' : '启动' }}
                 </button>
-                <button @click="healTask($event, job)" class="table-btn btn-success" title="检查脚本、权限、Cron 条目并试跑一次">立即修复</button>
+                <button
+                  @click="healTask($event, job)"
+                  :disabled="!job.needs_repair"
+                  :class="['table-btn', job.needs_repair ? 'btn-success' : 'btn-disabled']"
+                  :title="job.needs_repair ? '诊断脚本、权限、Cron 条目并试跑一次；如果仍失败会暂停调度' : '最近一次执行正常，无需修复'"
+                >
+                  {{ job.needs_repair ? '诊断修复' : '无需修复' }}
+                </button>
                 <button @click="deleteTask($event, job)" class="table-btn btn-delete">删除</button>
               </td>
             </tr>
             <tr v-if="ubuntuJobs.length === 0">
-              <td colspan="7" class="empty-row">沙盒中没有配置任何脚本型定时任务</td>
+              <td colspan="8" class="empty-row">沙盒中没有配置任何脚本型定时任务</td>
             </tr>
           </template>
         </tbody>

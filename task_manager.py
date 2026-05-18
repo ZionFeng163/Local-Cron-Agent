@@ -619,73 +619,139 @@ echo "$TOTAL" > {self.run_log_state_file}
     def try_heal_task(self, task_id: str, reason: str = "manual") -> Dict[str, Any]:
         task = get_task(task_id)
         if not task:
-            return {"ok": False, "msg": "任务不存在"}
+            return {"ok": False, "outcome": "unresolved", "msg": "任务不存在", "summary": "任务不存在，无法修复"}
         if task.source != "sandbox":
-            return {"ok": False, "msg": "仅支持沙盒任务自愈"}
+            return {
+                "ok": False,
+                "outcome": "unsupported",
+                "msg": "仅支持沙盒任务自愈",
+                "summary": "当前自愈只支持沙盒脚本任务",
+            }
 
         reason_text = reason or "manual"
         actions = ["diagnose_only"]
         normalized_script = normalize_script_path(task.script_path)
 
+        def build_result(ok: bool, category: str, action: str, msg: str,
+                         outcome: str, schedule_changed: bool = False,
+                         exit_code: Optional[int] = None,
+                         failures: Optional[int] = None,
+                         next_step: str = "") -> Dict[str, Any]:
+            current_task = get_task(task_id) or task
+            schedule_status = (current_task.status or "paused").upper()
+            schedule_label = "调度中" if schedule_status == "RUNNING" else "已暂停"
+            outcome_labels = {
+                "healthy": "无需修复",
+                "repaired": "已修复",
+                "unresolved": "未修复",
+                "unsupported": "不支持",
+                "error": "修复异常",
+            }
+            return {
+                "ok": ok,
+                "category": category,
+                "action": action,
+                "msg": msg,
+                "summary": msg,
+                "outcome": outcome,
+                "outcome_label": outcome_labels.get(outcome, outcome),
+                "schedule_changed": schedule_changed,
+                "schedule_status": schedule_status,
+                "schedule_label": schedule_label,
+                "exit_code": exit_code,
+                "failures": failures,
+                "next_step": next_step,
+            }
+
         try:
             if not normalized_script:
-                msg = "脚本路径不符合平台规范，仅支持 /home/ubuntu/.lca/scripts/*.sh"
+                msg = "修复未成功：脚本路径不符合平台规范，仅支持 /home/ubuntu/.lca/scripts/*.sh"
                 self._record_heal_result(
                     task_id, reason_text, "script_missing", "diagnose_only", False, msg,
                     failures=getattr(task, "consecutive_failures", 0)
                 )
-                return {"ok": False, "category": "script_missing", "action": "diagnose_only", "msg": msg}
+                return build_result(
+                    ok=False,
+                    category="script_missing",
+                    action="diagnose_only",
+                    msg=msg,
+                    outcome="unresolved",
+                    failures=getattr(task, "consecutive_failures", 0),
+                    next_step="重新生成或迁移为平台管理的 .sh 脚本后再启用调度",
+                )
 
             if not self._script_exists(normalized_script):
-                msg = f"脚本不存在: {normalized_script}"
+                msg = f"修复未成功：脚本不存在: {normalized_script}"
                 self._record_heal_result(
                     task_id, reason_text, "script_missing", "diagnose_only", False, msg,
                     failures=getattr(task, "consecutive_failures", 0)
                 )
-                return {"ok": False, "category": "script_missing", "action": "diagnose_only", "msg": msg}
+                return build_result(
+                    ok=False,
+                    category="script_missing",
+                    action="diagnose_only",
+                    msg=msg,
+                    outcome="unresolved",
+                    failures=getattr(task, "consecutive_failures", 0),
+                    next_step="重新生成脚本或删除这条失效任务",
+                )
 
             syntax = self._check_script_syntax(normalized_script)
             if syntax.returncode != 0:
-                msg = f"脚本语法检查失败: {(syntax.stderr or syntax.stdout or '').strip()[:300]}"
+                msg = f"修复未成功：脚本语法检查失败: {(syntax.stderr or syntax.stdout or '').strip()[:300]}"
                 self._record_heal_result(
                     task_id, reason_text, "syntax_error", "diagnose_only", False, msg,
                     exit_code=syntax.returncode, failures=getattr(task, "consecutive_failures", 0)
                 )
-                return {
-                    "ok": False,
-                    "category": "syntax_error",
-                    "action": "diagnose_only",
-                    "msg": msg,
-                    "exit_code": syntax.returncode,
-                }
+                return build_result(
+                    ok=False,
+                    category="syntax_error",
+                    action="diagnose_only",
+                    msg=msg,
+                    outcome="unresolved",
+                    exit_code=syntax.returncode,
+                    failures=getattr(task, "consecutive_failures", 0),
+                    next_step="修正脚本语法后再试跑",
+                )
 
             if not self._script_is_executable(normalized_script):
                 chmod = self._run_sandbox(f"chmod +x {shlex.quote(normalized_script)}", timeout=20, capture_output=True)
                 actions.append("chmod_fix")
                 if chmod.returncode != 0:
-                    msg = f"权限修复失败: {(chmod.stderr or chmod.stdout or '').strip()[:300]}"
+                    msg = f"修复未成功：权限修复失败: {(chmod.stderr or chmod.stdout or '').strip()[:300]}"
                     self._record_heal_result(
                         task_id, reason_text, "permission_error", "chmod_fix", False, msg,
                         exit_code=chmod.returncode, failures=getattr(task, "consecutive_failures", 0)
                     )
-                    return {
-                        "ok": False,
-                        "category": "permission_error",
-                        "action": "chmod_fix",
-                        "msg": msg,
-                        "exit_code": chmod.returncode,
-                    }
+                    return build_result(
+                        ok=False,
+                        category="permission_error",
+                        action="chmod_fix",
+                        msg=msg,
+                        outcome="unresolved",
+                        exit_code=chmod.returncode,
+                        failures=getattr(task, "consecutive_failures", 0),
+                        next_step="检查沙盒文件权限或用户权限",
+                    )
 
             if not self._cron_has_task(task_id):
                 self._sync_push_sandbox_full()
                 actions.append("cron_reinstall")
                 if not self._cron_has_task(task_id):
-                    msg = "Cron 条目缺失，尝试重装后仍未找到任务标记"
+                    msg = "修复未成功：Cron 条目缺失，尝试重装后仍未找到任务标记"
                     self._record_heal_result(
                         task_id, reason_text, "cron_missing", "cron_reinstall", False, msg,
                         failures=getattr(task, "consecutive_failures", 0)
                     )
-                    return {"ok": False, "category": "cron_missing", "action": "cron_reinstall", "msg": msg}
+                    return build_result(
+                        ok=False,
+                        category="cron_missing",
+                        action="cron_reinstall",
+                        msg=msg,
+                        outcome="unresolved",
+                        failures=getattr(task, "consecutive_failures", 0),
+                        next_step="检查 crontab 写入权限或沙盒连通性",
+                    )
 
             actions.append("trial_run")
             trial = self._record_trial_run(task, reason_text, "+".join(actions))
@@ -695,33 +761,41 @@ echo "$TOTAL" > {self.run_log_state_file}
                 mark_task_auto_heal(task_id, trial["run_at"])
 
             if trial["exit_code"] == 0:
-                msg = "脚本健康检查通过，试跑成功"
-                if task.status == "paused" and reason_text.startswith("manual"):
-                    resumed = self.toggle_task(task_id)
-                    msg = "脚本健康检查通过，任务已恢复运行" if resumed and resumed.status == "running" else "脚本健康检查通过，但任务恢复失败"
                 action_name = "no_action_needed" if actions == ["diagnose_only", "trial_run"] else "+".join(actions)
+                outcome = "healthy" if action_name == "no_action_needed" else "repaired"
+                current_task = get_task(task_id) or task
+                msg = "检查完成：脚本试跑成功"
+                if action_name != "no_action_needed":
+                    msg = "修复成功：轻修复后脚本试跑成功"
+                if current_task.status == "paused":
+                    msg += "，调度仍保持暂停"
                 self._record_heal_result(
                     task_id, reason_text, "healthy", action_name, True, msg,
                     exit_code=trial["exit_code"], failures=failures
                 )
-                return {
-                    "ok": True,
-                    "category": "healthy",
-                    "action": action_name,
-                    "msg": msg,
-                    "exit_code": trial["exit_code"],
-                    "failures": failures,
-                }
+                return build_result(
+                    ok=True,
+                    category="healthy",
+                    action=action_name,
+                    msg=msg,
+                    outcome=outcome,
+                    schedule_changed=False,
+                    exit_code=trial["exit_code"],
+                    failures=failures,
+                    next_step="可以继续保持调度" if current_task.status == "running" else "脚本健康；如需继续定时执行，请手动点击启动",
+                )
 
             category = "runtime_error"
             action_name = "+".join(actions)
-            msg = f"脚本试跑失败，退出码 {trial['exit_code']}"
+            msg = f"修复未成功：脚本仍返回退出码 {trial['exit_code']}"
+            schedule_changed = False
             if task.status == "running":
                 updated = self.toggle_task(task_id)
                 if updated and updated.status == "paused":
+                    schedule_changed = True
                     actions.append("pause_after_failed_heal")
                     action_name = "+".join(actions)
-                    msg += "，任务已自动暂停"
+                    msg += "，已暂停调度以避免继续失败"
 
             self._record_heal_result(
                 task_id=task_id,
@@ -733,16 +807,19 @@ echo "$TOTAL" > {self.run_log_state_file}
                 exit_code=trial["exit_code"],
                 failures=failures,
             )
-            return {
-                "ok": False,
-                "category": category,
-                "action": action_name,
-                "msg": msg,
-                "exit_code": trial["exit_code"],
-                "failures": failures,
-            }
+            return build_result(
+                ok=False,
+                category=category,
+                action=action_name,
+                msg=msg,
+                outcome="unresolved",
+                schedule_changed=schedule_changed,
+                exit_code=trial["exit_code"],
+                failures=failures,
+                next_step="查看任务运行记录里的输出，修正脚本逻辑后再启动调度",
+            )
         except Exception as e:
-            msg = f"自愈执行异常: {e}"
+            msg = f"修复流程异常: {e}"
             if not reason_text.startswith("manual"):
                 mark_task_auto_heal(task_id, _now())
             self._record_heal_result(
@@ -753,12 +830,14 @@ echo "$TOTAL" > {self.run_log_state_file}
                 ok=False,
                 message=msg,
             )
-            return {
-                "ok": False,
-                "category": "unknown",
-                "action": "+".join(actions),
-                "msg": msg
-            }
+            return build_result(
+                ok=False,
+                category="unknown",
+                action="+".join(actions),
+                msg=msg,
+                outcome="error",
+                next_step="检查后端日志后重试",
+            )
 
 
     def get_task_runs(self, task_id: str, limit: int = 20) -> List[Dict[str, Any]]:

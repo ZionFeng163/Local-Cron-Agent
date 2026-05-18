@@ -1,5 +1,4 @@
 import logging
-import json
 import re
 import threading
 import uuid
@@ -105,36 +104,6 @@ class LangGraphOrchestrator:
             ),
         }
 
-    def _route_task_rule(self, task: str) -> str:
-        text = task.lower()
-
-        cron_keywords = [
-            "cron", "crontab", "定时", "任务", "调度", "暂停", "恢复", "启动", "删除",
-            "每隔", "每天", "每小时", "每分钟", "心跳",
-        ]
-        script_keywords = [
-            "脚本", "script", ".py", ".sh", "写入", "生成代码", "创建文件", "文件", "保存",
-            "挂载", "部署",
-        ]
-        script_intent_keywords = ["写", "生成", "创建", "保存", "编写"]
-        ops_keywords = [
-            "健康", "巡检", "检查", "cpu", "内存", "磁盘", "负载", "服务", "systemctl",
-            "重启", "修复", "异常", "报错", "日志", "执行命令", "bash",
-        ]
-        research_keywords = ["搜索", "查询资料", "新闻", "联网", "google", "资料", "查一下"]
-
-        if any(kw in text for kw in script_keywords) and any(kw in text for kw in script_intent_keywords):
-            return "script"
-
-        scores = {
-            "cron": sum(1 for kw in cron_keywords if kw in text),
-            "script": sum(1 for kw in script_keywords if kw in text),
-            "ops": sum(1 for kw in ops_keywords if kw in text),
-            "research": sum(1 for kw in research_keywords if kw in text),
-        }
-        route, score = max(scores.items(), key=lambda item: item[1])
-        return route if score > 0 else "general"
-
     def _extract_json_text(self, content: str) -> str:
         if not content:
             return ""
@@ -178,28 +147,19 @@ class LangGraphOrchestrator:
 
     def _fallback_plan(self, user_input: str) -> List[Dict[str, object]]:
         text = user_input.strip() or "执行用户请求"
-        normalized_text = text
-        for sep in ["然后", "接着", "并且", "再", ";", "；", "\n"]:
-            normalized_text = normalized_text.replace(sep, "。")
-        parts = [p.strip() for p in re.split(r"[。.!?]", normalized_text) if p.strip()] or [text]
-
-        steps = []
-        for idx, part in enumerate(parts[:5], start=1):
-            worker_key = self._route_task_rule(part)
-            steps.append(
-                {
-                    "step_id": idx,
-                    "task": part,
-                    "worker_key": worker_key,
-                    "worker_name": self._worker_name(worker_key),
-                    "objective": part,
-                    "confidence": 0.6,
-                    "reason": "fallback_rule",
-                    "status": "pending",
-                    "result": "",
-                }
-            )
-        return steps
+        return [
+            {
+                "step_id": 1,
+                "task": text,
+                "worker_key": "general",
+                "worker_name": self._worker_name("general"),
+                "objective": text,
+                "confidence": 0.5,
+                "reason": "leader_plan_fallback",
+                "status": "pending",
+                "result": "",
+            }
+        ]
 
     def _leader_plan(self, user_input: str) -> List[Dict[str, object]]:
         sys_prompt = """
@@ -229,9 +189,6 @@ worker_key 只能是:
         except Exception as e:
             logger.warning("Leader plan fallback: %s", e)
             return self._fallback_plan(user_input)
-
-    def _get_worker(self, route: str) -> StreamingFCAgent:
-        return self.worker_agents.get(route, self.worker_agents["general"])
 
     def _extract_callback(self, config: Optional[RunnableConfig]):
         if not config:

@@ -42,6 +42,23 @@ const fetchData = async () => {
 
 onMounted(fetchData)
 defineExpose({ fetchData })
+
+const scheduleLabel = (job) => job.schedule_label || (job.status === 'RUNNING' ? '调度中' : '已暂停')
+const healthLabel = (job) => job.health_label || '未检测'
+const healthBadgeClass = (job) => {
+  if (job.health_status === 'HEALTHY') return 'badge-running'
+  if (job.health_status === 'FAILING') return 'badge-failing'
+  return 'badge-unknown'
+}
+const scheduleBadgeClass = (job) => {
+  if (job.status !== 'RUNNING') return 'badge-paused'
+  if (job.health_status === 'FAILING') return 'badge-failing'
+  return 'badge-running'
+}
+const scheduleDisplayLabel = (job) => {
+  if (job.status === 'RUNNING' && job.health_status === 'FAILING') return '异常调度中'
+  return scheduleLabel(job)
+}
 </script>
 
 <template>
@@ -58,7 +75,7 @@ defineExpose({ fetchData })
       </div>
       <div class="stat-card stat-running">
         <div class="stat-number">{{ stats.running }}</div>
-        <div class="stat-label">运行中</div>
+        <div class="stat-label">调度中</div>
       </div>
       <div class="stat-card stat-paused">
         <div class="stat-number">{{ stats.paused }}</div>
@@ -88,8 +105,11 @@ defineExpose({ fetchData })
           <div v-if="ubuntuJobs.length === 0" class="empty-small">沙盒没有配置脚本型定时任务</div>
           <div v-for="job in ubuntuJobs" :key="job.id" class="mini-job" @click="emit('showDetail', job)">
             <span class="mini-name">{{ job.name || job.script_path?.split('/').pop() || '脚本任务' }}</span>
-            <span :class="['status-badge', job.status === 'RUNNING' ? 'badge-running' : 'badge-paused']">
-              {{ job.status === 'RUNNING' ? '运行中' : '已暂停' }}
+            <span class="mini-badges">
+              <span :class="['status-badge', scheduleBadgeClass(job)]" :title="job.status_explanation">
+                {{ scheduleDisplayLabel(job) }}
+              </span>
+              <span :class="['status-badge', healthBadgeClass(job)]" :title="job.status_explanation">{{ healthLabel(job) }}</span>
             </span>
           </div>
         </template>

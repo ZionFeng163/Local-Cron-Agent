@@ -13,15 +13,12 @@ load_dotenv(override=True)
 import shlex
 import subprocess
 from contextlib import asynccontextmanager
-from dataclasses import asdict
 from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-from exquisite_agent.llm import LLM
 
 from tools.sandbox_bash_executor import SandboxBashExecutor
 from tools.sandbox_crontab_admin import SandboxCrontabAdmin
@@ -33,15 +30,20 @@ from exquisite_agent.tools.searchtool import SearchTool
 
 from task_manager import TaskManager
 from langgraph_orchestrator import LangGraphOrchestrator
-from streaming_fc_agent import StreamingFCAgent
 from redis_state import redis_state
+from models import (
+    create_chat_session,
+    get_chat_messages,
+    get_chat_session,
+    insert_chat_message,
+    list_chat_sessions,
+)
 
 # 日志输出配置
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s', datefmt='%H:%M:%S')
 
 # 全局状态
 scheduler = AsyncIOScheduler()
-agent = None
 orchestrator = None
 task_mgr: TaskManager = None
 connected_clients: List[WebSocket] = []
@@ -50,6 +52,7 @@ connected_clients: List[WebSocket] = []
 # ========== 核心后台心跳 + 系统健康自愈 ==========
 health_lock = threading.Lock()
 last_system_health_report: Optional[Dict[str, Any]] = None
+TASK_AUTO_HEAL_FAILURE_THRESHOLD = 1
 
 
 def _run_in_sandbox(cmd: str, timeout: int = 20) -> subprocess.CompletedProcess:
@@ -301,10 +304,10 @@ def task_monitor_job():
                 continue
 
             failures = probe["failures"]
-            if failures >= 3:
+            if failures >= TASK_AUTO_HEAL_FAILURE_THRESHOLD:
                 result = task_mgr.try_heal_task(task.id, reason="auto_threshold")
                 logging.warning(
-                    f"🛠️ 任务自愈触发: {task.name} failures={failures} result={result.get('msg')}"
+                    f"🛠️ 任务自愈触发: {task.name} failures={failures}/{TASK_AUTO_HEAL_FAILURE_THRESHOLD} result={result.get('msg')}"
                 )
     except Exception as e:
         logging.error(f"❌ 任务监测异常: {e}")
@@ -323,7 +326,7 @@ async def broadcast_refresh_jobs():
 # ========== API 与框架生命周期 ==========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global agent, orchestrator, task_mgr
+    global orchestrator, task_mgr
     logging.info("🚀 正在启动 Local-Cron-Agent 同步式 Web 后端 (Uvicorn)...")
 
     # 每 3600 秒自动运行内部体检
@@ -366,34 +369,11 @@ async def lifespan(app: FastAPI):
     file_writer_tool = SandboxFileWriter()
     search_tool = SearchTool()
 
-    agent = StreamingFCAgent(
-        llm=LLM(),
-        name="Local-Cron-Agent",
-        tools=[bash_tool, cron_tool, sys_tool, svc_tool, sched_tool, file_writer_tool, search_tool]
-    )
-    agent.max_iterations = 8
-    
     # 初始化 LangGraph 编排器
     orchestrator = LangGraphOrchestrator(
         tools=[bash_tool, cron_tool, sys_tool, svc_tool, sched_tool, file_writer_tool, search_tool],
         task_mgr=task_mgr
     )
-
-    agent.system_prompt = """
-    你是 Local-Cron-Agent (自愈管家)。你可以和用户在 Web 界面对话。
-    如果用户明确要求操作"底座/沙盒"定时任务，使用 Sandbox_Crontab_Admin。
-    如果用户明确要求操作"内置心跳/自检"，使用 Agent_Heartbeat_Controller。
-    如果遭遇"编写/下发/挂载长期脚本跑后台"的任务，一定先用 Sandbox_File_Writer 生成脚本源码进入沙盒环境，随后用 Sandbox_Crontab_Admin 将其装载在 Cron 中运行。
-    当你缺乏外部情报时，可以调用 Search 进行谷歌搜索。
-    
-    【核心守则】：
-    1. 当用户毫无特指地说"打印目前所有任务"、"列出任务"时，默认包含内置和沙盒任务，必须连续调用 list 功能。
-    2. 【重点】创建任务时：
-       - `task_name` 必须是精炼、人类可读的（如“备份脚本”），严禁填入 shell 代码。
-       - `description` 必须详细说明该任务的目标（如“每隔5分钟检查一次cpu占用”）。
-    
-    执行完成后用友好的回答作结。
-    """
 
     yield
 
@@ -413,24 +393,74 @@ app.add_middleware(
 
 # ========== 任务 API（全部读写 DB，毫秒级响应）==========
 
+def _task_health_fields(t):
+    last_exit_code = getattr(t, "last_exit_code", None)
+    failures = int(getattr(t, "consecutive_failures", 0) or 0)
+    last_run_at = getattr(t, "last_run_at", "") or ""
+
+    if not last_run_at and last_exit_code is None:
+        health_status = "UNKNOWN"
+        last_run_status = "UNKNOWN"
+    elif last_exit_code == 0 and failures == 0:
+        health_status = "HEALTHY"
+        last_run_status = "SUCCESS"
+    else:
+        health_status = "FAILING"
+        last_run_status = "FAILED"
+
+    health_labels = {
+        "UNKNOWN": "未检测",
+        "HEALTHY": "健康",
+        "FAILING": "异常",
+    }
+    last_run_labels = {
+        "UNKNOWN": "未运行",
+        "SUCCESS": "成功",
+        "FAILED": "失败",
+    }
+    return {
+        "health_status": health_status,
+        "health_label": health_labels[health_status],
+        "last_run_status": last_run_status,
+        "last_run_label": last_run_labels[last_run_status],
+        "needs_repair": health_status == "FAILING",
+        "auto_heal_threshold": TASK_AUTO_HEAL_FAILURE_THRESHOLD,
+    }
+
+
 def _task_to_dict(t):
     """将 Task 对象转为前端可用的 dict"""
+    schedule_status = t.status.upper()
+    schedule_label = "调度中" if schedule_status == "RUNNING" else "已暂停"
+    health_fields = _task_health_fields(t)
+    failures = int(getattr(t, "consecutive_failures", 0) or 0)
+    status_explanation = "尚未检测到运行结果"
+    if health_fields["health_status"] == "HEALTHY":
+        status_explanation = "最近一次执行成功"
+    elif health_fields["health_status"] == "FAILING" and schedule_status == "RUNNING":
+        status_explanation = f"最近执行失败；达到 {TASK_AUTO_HEAL_FAILURE_THRESHOLD} 次失败会自动诊断并暂停"
+    elif health_fields["health_status"] == "FAILING":
+        status_explanation = f"最近执行失败；当前调度已暂停，连续失败 {failures} 次"
     return {
         "id": t.id,
         "name": t.name,
         "source": t.source,
         "cron_expr": t.cron_expr,
         "script_path": t.script_path,
-        "status": t.status.upper(),  # 前端用大写 RUNNING/PAUSED
+        "status": schedule_status,  # 前端兼容旧字段：RUNNING 表示 cron 调度开启
+        "schedule_status": schedule_status,
+        "schedule_label": schedule_label,
         "description": t.description,
         "created_at": t.created_at,
         "updated_at": t.updated_at,
         "monitor_enabled": bool(getattr(t, "monitor_enabled", 1)),
-        "consecutive_failures": getattr(t, "consecutive_failures", 0),
+        "consecutive_failures": failures,
         "last_run_at": getattr(t, "last_run_at", ""),
         "last_success_at": getattr(t, "last_success_at", ""),
         "last_exit_code": getattr(t, "last_exit_code", None),
         "last_auto_heal_at": getattr(t, "last_auto_heal_at", ""),
+        "status_explanation": status_explanation,
+        **health_fields,
     }
 
 @app.get("/api/jobs")
@@ -689,6 +719,45 @@ class HealthCheckReq(BaseModel):
     auto_heal: bool = True
 
 
+class ChatSessionCreateReq(BaseModel):
+    title: str = "新对话"
+
+
+def _build_agent_input(content: str, history: List[Dict[str, Any]]) -> str:
+    if not history:
+        return content
+
+    lines = ["以下是当前会话最近上下文，请结合上下文继续完成用户最新请求。"]
+    for item in history[-8:]:
+        role = "用户" if item.get("role") == "user" else "AI"
+        text = (item.get("content") or "").strip()
+        if not text:
+            continue
+        if len(text) > 1200:
+            text = text[:1200].rstrip() + "..."
+        lines.append(f"{role}: {text}")
+    lines.append(f"用户最新请求: {content}")
+    return "\n\n".join(lines)
+
+
+@app.get("/api/chat/sessions")
+async def get_chat_sessions(limit: int = 50):
+    return {"sessions": list_chat_sessions(limit=limit)}
+
+
+@app.post("/api/chat/sessions")
+async def create_chat_session_api(req: Optional[ChatSessionCreateReq] = None):
+    title = req.title if req else "新对话"
+    return {"session": create_chat_session(title or "新对话")}
+
+
+@app.get("/api/chat/sessions/{session_id}/messages")
+async def get_chat_session_messages_api(session_id: str, limit: int = 200):
+    if not get_chat_session(session_id):
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {"session_id": session_id, "messages": get_chat_messages(session_id, limit=limit)}
+
+
 @app.get("/api/system/health")
 async def get_system_health():
     with health_lock:
@@ -719,11 +788,32 @@ async def websocket_endpoint(websocket: WebSocket):
     connected_clients.append(websocket)
     try:
         while True:
-            user_msg = await websocket.receive_text()
+            raw_msg = await websocket.receive_text()
+            try:
+                payload = json.loads(raw_msg)
+                if isinstance(payload, dict):
+                    user_msg = str(payload.get("content") or "").strip()
+                    session_id = str(payload.get("session_id") or "").strip()
+                else:
+                    user_msg = str(raw_msg).strip()
+                    session_id = ""
+            except json.JSONDecodeError:
+                user_msg = str(raw_msg).strip()
+                session_id = ""
+
+            if not user_msg:
+                continue
+            if not session_id or not get_chat_session(session_id):
+                session = create_chat_session()
+                session_id = session["session_id"]
+
             logging.info(f"UI 用户发送了: {user_msg}")
 
             q = queue.Queue()
             run_id = f"run-{uuid.uuid4().hex[:12]}"
+            insert_chat_message(session_id, "user", user_msg, run_id=run_id)
+            history = get_chat_messages(session_id, limit=9)
+            agent_input = _build_agent_input(user_msg, history[:-1])
 
             def sync_worker(msg, q_out, rid):
                 try:
@@ -735,11 +825,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     q_out.put({"type": "message", "content": f"\n\n[核心异常]: {str(e)}"})
                     q_out.put(None)
 
-            thread = threading.Thread(target=sync_worker, args=(user_msg, q, run_id))
+            thread = threading.Thread(target=sync_worker, args=(agent_input, q, run_id))
             thread.start()
 
-            await websocket.send_json({"type": "stream_start", "run_id": run_id})
+            await websocket.send_json({"type": "stream_start", "run_id": run_id, "session_id": session_id})
             last_heartbeat_ts = asyncio.get_running_loop().time()
+            agent_reply_parts: List[str] = []
 
             while True:
                 try:
@@ -758,9 +849,16 @@ async def websocket_endpoint(websocket: WebSocket):
                     task_mgr.sync_internal_tasks()
                     await broadcast_refresh_jobs()
                     continue
+                if item.get("type") in {"content_chunk", "message"}:
+                    content = item.get("content") or ""
+                    if content.strip():
+                        agent_reply_parts.append(content)
                 await websocket.send_json(item)
 
-            await websocket.send_json({"type": "stream_end"})
+            agent_reply = "".join(agent_reply_parts).strip()
+            if agent_reply:
+                insert_chat_message(session_id, "agent", agent_reply, run_id=run_id)
+            await websocket.send_json({"type": "stream_end", "session_id": session_id})
             await broadcast_refresh_jobs()
 
     except WebSocketDisconnect:

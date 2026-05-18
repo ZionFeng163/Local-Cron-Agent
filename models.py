@@ -116,6 +116,31 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_task_heal_created_at ON task_heal_records(created_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_task_heal_task_created ON task_heal_records(task_id, created_at DESC)")
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_sessions (
+            session_id TEXT PRIMARY KEY,
+            title TEXT DEFAULT '新对话',
+            created_at TEXT DEFAULT '',
+            updated_at TEXT DEFAULT '',
+            last_message_at TEXT DEFAULT '',
+            archived INTEGER DEFAULT 0
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            message_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT DEFAULT '',
+            created_at TEXT DEFAULT '',
+            run_id TEXT DEFAULT '',
+            seq INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated ON chat_sessions(updated_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_session_seq ON chat_messages(session_id, seq)")
+
     conn.commit()
     conn.close()
 
@@ -390,6 +415,159 @@ def count_task_heal_records(task_id: str = "", trigger: str = "", category: str 
     ).fetchone()
     conn.close()
     return int(row["total"] if row else 0)
+
+
+def _chat_title_from_content(content: str) -> str:
+    title = " ".join((content or "").strip().split())
+    if not title:
+        return "新对话"
+    return title[:20]
+
+
+def create_chat_session(title: str = "新对话") -> Dict[str, Any]:
+    now = _now()
+    session_id = gen_id()
+    safe_title = _chat_title_from_content(title) if title and title != "新对话" else "新对话"
+    conn = _connect()
+    conn.execute(
+        """
+        INSERT INTO chat_sessions (session_id, title, created_at, updated_at, last_message_at, archived)
+        VALUES (?, ?, ?, ?, ?, 0)
+        """,
+        (session_id, safe_title, now, now, "")
+    )
+    conn.commit()
+    row = conn.execute(
+        """
+        SELECT session_id, title, created_at, updated_at, last_message_at, archived
+        FROM chat_sessions
+        WHERE session_id = ?
+        """,
+        (session_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def get_chat_session(session_id: str) -> Optional[Dict[str, Any]]:
+    conn = _connect()
+    row = conn.execute(
+        """
+        SELECT session_id, title, created_at, updated_at, last_message_at, archived
+        FROM chat_sessions
+        WHERE session_id = ? AND archived = 0
+        """,
+        (session_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_chat_sessions(limit: int = 50) -> List[Dict[str, Any]]:
+    safe_limit = max(1, min(limit, 100))
+    conn = _connect()
+    rows = conn.execute(
+        """
+        SELECT
+            s.session_id,
+            s.title,
+            s.created_at,
+            s.updated_at,
+            s.last_message_at,
+            s.archived,
+            (
+                SELECT content
+                FROM chat_messages m
+                WHERE m.session_id = s.session_id
+                ORDER BY m.seq DESC
+                LIMIT 1
+            ) AS last_message
+        FROM chat_sessions s
+        WHERE s.archived = 0
+        ORDER BY COALESCE(NULLIF(s.last_message_at, ''), s.updated_at) DESC
+        LIMIT ?
+        """,
+        (safe_limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_chat_messages(session_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+    safe_limit = max(1, min(limit, 500))
+    conn = _connect()
+    rows = conn.execute(
+        """
+        SELECT message_id, session_id, role, content, created_at, run_id, seq
+        FROM (
+            SELECT message_id, session_id, role, content, created_at, run_id, seq
+            FROM chat_messages
+            WHERE session_id = ?
+            ORDER BY seq DESC
+            LIMIT ?
+        )
+        ORDER BY seq ASC
+        """,
+        (session_id, safe_limit)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def insert_chat_message(session_id: str, role: str, content: str, run_id: str = "") -> Dict[str, Any]:
+    now = _now()
+    conn = _connect()
+    row = conn.execute(
+        "SELECT title FROM chat_sessions WHERE session_id = ? AND archived = 0",
+        (session_id,)
+    ).fetchone()
+    if not row:
+        conn.execute(
+            """
+            INSERT INTO chat_sessions (session_id, title, created_at, updated_at, last_message_at, archived)
+            VALUES (?, '新对话', ?, ?, '', 0)
+            """,
+            (session_id, now, now)
+        )
+        row = {"title": "新对话"}
+
+    max_row = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM chat_messages WHERE session_id = ?",
+        (session_id,)
+    ).fetchone()
+    seq = int(max_row["max_seq"] or 0) + 1
+    message_id = gen_id()
+    conn.execute(
+        """
+        INSERT INTO chat_messages (message_id, session_id, role, content, created_at, run_id, seq)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (message_id, session_id, role, content or "", now, run_id or "", seq)
+    )
+
+    title = row["title"] if row else "新对话"
+    if role == "user" and (not title or title == "新对话"):
+        title = _chat_title_from_content(content)
+
+    conn.execute(
+        """
+        UPDATE chat_sessions
+        SET title = ?, updated_at = ?, last_message_at = ?
+        WHERE session_id = ?
+        """,
+        (title, now, now, session_id)
+    )
+    conn.commit()
+    saved = conn.execute(
+        """
+        SELECT message_id, session_id, role, content, created_at, run_id, seq
+        FROM chat_messages
+        WHERE message_id = ?
+        """,
+        (message_id,)
+    ).fetchone()
+    conn.close()
+    return dict(saved)
 
 
 def gen_id() -> str:

@@ -22,6 +22,17 @@ const pagination = ref({
 })
 
 const boolText = (v) => (Number(v) === 1 ? '成功' : '失败')
+const categoryText = (code) => {
+  const item = catalog.value.categories.find((c) => c.code === code)
+  return item ? item.label : (code || '---')
+}
+const actionText = (code) => {
+  if (!code) return '---'
+  return code.split('+').map((part) => {
+    const item = catalog.value.actions.find((a) => a.code === part)
+    return item ? item.label : part
+  }).join(' + ')
+}
 const triggerText = (v) => {
   if (v === 'manual') return '手动'
   if (v === 'auto_threshold') return '自动阈值'
@@ -220,8 +231,8 @@ onMounted(refreshAll)
             <td class="mono">{{ row.created_at || '---' }}</td>
             <td :title="row.task_id">{{ getTaskName(row.task_id) }}</td>
             <td>{{ triggerText(row.trigger) }}</td>
-            <td class="mono">{{ row.category || '---' }}</td>
-            <td class="mono">{{ row.action || '---' }}</td>
+            <td :title="row.category" class="mono">{{ categoryText(row.category) }}</td>
+            <td :title="row.action" class="mono">{{ actionText(row.action) }}</td>
             <td>
               <span :class="['status-badge', Number(row.ok) === 1 ? 'badge-running' : 'badge-paused']">
                 {{ boolText(row.ok) }}
