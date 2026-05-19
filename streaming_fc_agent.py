@@ -1,6 +1,5 @@
 import json
 import os
-import uuid
 from typing import Any, Dict, Iterable, List, Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -10,10 +9,7 @@ from langchain_core.tools import StructuredTool
 from langgraph.prebuilt import create_react_agent
 from openai import OpenAI
 
-try:
-    from exquisite_agent.memory import AgentMemory
-except Exception:  # noqa: BLE001
-    AgentMemory = None
+from experience_memory import tool_observation_ok
 
 
 class OpenAICompatibleChatModel(BaseChatModel):
@@ -164,7 +160,6 @@ class StreamingFCAgent:
         self.tools = tools or []
         self.system_prompt = f"你是一个名为 {self.name} 的智能助手。尽可能使用工具来解决用户的问题。"
         self.max_iterations = 8
-        self.memory = AgentMemory() if AgentMemory else None
         self._lc_tools = [self._wrap_tool(tool) for tool in self.tools]
 
     def _make_model(self) -> OpenAICompatibleChatModel:
@@ -172,7 +167,7 @@ class StreamingFCAgent:
         if not api_key:
             raise RuntimeError("You must set LLM_API_KEY")
         return OpenAICompatibleChatModel(
-            model_name=os.getenv("LLM_MODEL_ID") or "gpt-4o-mini",
+            model_name=os.getenv("LLM_MODEL_ID") or "qwen3.5-flash",
             api_key=api_key,
             base_url=os.getenv("LLM_BASE_URL") or None,
             temperature=0.1,
@@ -192,113 +187,14 @@ class StreamingFCAgent:
             args_schema=params,
         )
 
-    def _clip_text(self, text: str, limit: int = 1200) -> str:
-        text = (text or "").strip()
-        if len(text) <= limit:
-            return text
-        return text[:limit].rstrip() + "..."
-
-    def _split_text_chunks(self, text: str, max_chars: int = 900):
-        text = (text or "").strip()
-        if not text:
-            return []
-        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()] or [text]
-
-        chunks = []
-        current = ""
-        for paragraph in paragraphs:
-            if len(paragraph) > max_chars:
-                if current:
-                    chunks.append(current)
-                    current = ""
-                for start in range(0, len(paragraph), max_chars):
-                    chunks.append(paragraph[start:start + max_chars].strip())
-                continue
-
-            candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
-            if len(candidate) <= max_chars:
-                current = candidate
-            else:
-                chunks.append(current)
-                current = paragraph
-
-        if current:
-            chunks.append(current)
-        return chunks
-
-    def _build_experience_chunks(self, user_input: str, final_content: str, tool_trace):
-        tool_lines = []
-        for item in tool_trace:
-            tool_lines.append(
-                f"- 工具: {item['name']}\n"
-                f"  参数: {self._clip_text(item.get('args', ''), 500)}\n"
-                f"  结果: {self._clip_text(item.get('observation', ''), 700)}"
-            )
-
-        sections = []
-        if tool_lines:
-            sections.append("工具调用链路:\n" + "\n".join(tool_lines))
-        if final_content:
-            sections.append("最终处理结果:\n" + self._clip_text(final_content, 1600))
-
-        body = "\n\n".join(sections).strip()
-        if not body:
-            return []
-
-        raw_chunks = self._split_text_chunks(body)
-        total = len(raw_chunks)
-        return [
-            {
-                "document": f"任务目标: {self._clip_text(user_input, 500)}\n经验片段 {idx}/{total}:\n{chunk}",
-                "solution": f"[可复用 SOP 片段 {idx}/{total}]\n历史任务: {self._clip_text(user_input, 500)}\n{chunk}",
-            }
-            for idx, chunk in enumerate(raw_chunks, start=1)
-        ]
-
-    def _consolidate_chunked_memory(self, user_input: str, final_content: str, tool_trace):
-        if not self.memory or not tool_trace or not final_content:
-            return
-
-        chunks = self._build_experience_chunks(user_input, final_content, tool_trace)
-        if not chunks:
-            return
-
-        ltm = getattr(self.memory, "ltm", None)
-        collection = getattr(ltm, "collection", None)
-        if not collection:
-            self.memory.consolidate_memory(user_input, final_content)
-            return
-
-        base_id = uuid.uuid4().hex[:8]
-        collection.add(
-            documents=[chunk["document"] for chunk in chunks],
-            metadatas=[
-                {
-                    "solution": chunk["solution"],
-                    "source": "langgraph_react_chunked_tool_experience",
-                    "agent": self.name,
-                    "chunk_index": idx,
-                    "chunk_total": len(chunks),
-                }
-                for idx, chunk in enumerate(chunks, start=1)
-            ],
-            ids=[f"sop_chunk_{base_id}_{idx}" for idx in range(1, len(chunks) + 1)],
-        )
-        print(f"[ChunkedMemory] 已沉淀 {len(chunks)} 个 SOP chunk")
-
-    def _prompt_with_memory(self, user_input: str) -> str:
-        if not self.memory:
-            return self.system_prompt
-        self.memory.clear_messages()
-        self.memory.set_current_task(user_input)
-        sop = getattr(self.memory, "current_sop_prompt", "")
+    def _prompt_with_memory(self, sop: str = "") -> str:
         return f"{self.system_prompt}\n{sop}" if sop else self.system_prompt
 
-    def _new_agent(self, user_input: str):
+    def _new_agent(self, user_input: str, sop: str = ""):
         return create_react_agent(
             self._make_model(),
             self._lc_tools,
-            prompt=self._prompt_with_memory(user_input),
+            prompt=self._prompt_with_memory(sop),
             version="v2",
             name=self.name,
         )
@@ -310,8 +206,8 @@ class StreamingFCAgent:
                 content += chunk.get("content", "")
         return content
 
-    def run_stream(self, user_input: str):
-        agent = self._new_agent(user_input)
+    def run_stream(self, user_input: str, sop: str = ""):
+        agent = self._new_agent(user_input, sop=sop)
         final_content = ""
         tool_trace = []
         tool_call_names: Dict[str, str] = {}
@@ -344,7 +240,14 @@ class StreamingFCAgent:
             yield {"type": "content_end"}
             return
 
-        self._consolidate_chunked_memory(user_input, final_content, tool_trace)
+        if tool_trace and final_content:
+            yield {
+                "type": "experience_candidate",
+                "worker": self.name,
+                "task": user_input,
+                "final_content": final_content,
+                "tool_trace": tool_trace,
+            }
         yield {"type": "content_end"}
 
     def _handle_stream_chunk(
@@ -399,9 +302,11 @@ class StreamingFCAgent:
                     tool_name = tool_call_names.get(message.tool_call_id, "unknown_tool")
                     observation = str(message.content)
                     args = tool_call_args.get(message.tool_call_id, "")
-                    tool_trace.append({"name": tool_name, "args": str(args), "observation": observation})
+                    ok = tool_observation_ok(observation)
+                    tool_trace.append({"name": tool_name, "args": str(args), "observation": observation, "ok": ok})
                     preview = observation.strip().replace("\n", " ")
                     if len(preview) > 180:
                         preview = preview[:180] + "..."
-                    yield {"type": "tool_result", "content": f"✅ {tool_name} 执行完成：{preview}"}
+                    prefix = "✅ 执行完成" if ok else "⚠️ 执行失败"
+                    yield {"type": "tool_result", "content": f"{prefix}：{tool_name}：{preview}", "ok": ok}
                     yield {"type": "tool_ended", "func_name": tool_name}

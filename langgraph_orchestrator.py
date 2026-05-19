@@ -11,6 +11,7 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
+from experience_memory import ExperienceMemoryPolicy
 from redis_state import redis_state
 from streaming_fc_agent import StreamingFCAgent
 
@@ -39,8 +40,12 @@ class AgentState(TypedDict):
     current_step_idx: int
     execution_context: str
     step_results: List[Dict[str, object]]
+    experience_candidates: List[Dict[str, object]]
     final_answer: str
     run_id: str
+    thread_id: str
+    memory_sop: str
+    memory_lookup: Dict[str, object]
 
 
 class LangGraphOrchestrator:
@@ -58,6 +63,7 @@ class LangGraphOrchestrator:
 
         self.worker_agents = self._build_worker_agents(LLM)
         self.leader_llm = LLM()
+        self.experience_policy = ExperienceMemoryPolicy()
         self.worker_confidence_threshold = 0.55
         self.graph = self._build_graph()
 
@@ -231,17 +237,32 @@ worker_key 只能是:
         cb = self._extract_callback(config)
         user_input = state["messages"][0].content
         plan = self._leader_plan(user_input)
+        memory_lookup = self.experience_policy.retrieve_sop_once(user_input, plan)
+        memory_sop = str(memory_lookup.get("sop") or "")
+        execution_context = ""
+        if memory_sop:
+            execution_context = "[长期记忆 SOP]\n" + memory_sop
         redis_state.set_run_status(
             state["run_id"],
-            {"status": "planned", "total_steps": len(plan), "current_step": 0, "plan": plan},
+            {
+                "status": "planned",
+                "thread_id": state.get("thread_id", ""),
+                "total_steps": len(plan),
+                "current_step": 0,
+                "plan": plan,
+                "memory_lookup": {k: v for k, v in memory_lookup.items() if k != "sop"},
+            },
         )
         plan_lines = [f"{step['step_id']}. {step['worker_name']}: {step['task']}" for step in plan]
         self._emit_status(cb, "🧭 Leader 已生成执行计划：\n" + "\n".join(plan_lines))
         return {
             "plan": plan,
             "current_step_idx": 0,
-            "execution_context": "",
+            "execution_context": execution_context,
             "step_results": [],
+            "experience_candidates": [],
+            "memory_sop": memory_sop,
+            "memory_lookup": memory_lookup,
             "messages": [AIMessage(content=f"🏗️ [Leader 规划] 共 {len(plan)} 步")],
         }
 
@@ -263,6 +284,7 @@ worker_key 只能是:
                 state["run_id"],
                 {
                     "status": "worker_running",
+                    "thread_id": state.get("thread_id", ""),
                     "current_step": idx + 1,
                     "total_steps": len(plan),
                     "worker": worker.name,
@@ -282,8 +304,17 @@ worker_key 只能是:
             )
 
             result_parts = []
+            experience_candidates = list(state.get("experience_candidates") or [])
             try:
-                for chunk in worker.run_stream(worker_prompt):
+                for chunk in worker.run_stream(worker_prompt, sop=str(state.get("memory_sop") or "")):
+                    if chunk.get("type") == "experience_candidate":
+                        candidate = dict(chunk)
+                        candidate.pop("type", None)
+                        candidate["worker"] = worker.name
+                        candidate["step_id"] = step.get("step_id", idx + 1)
+                        candidate["step_task"] = task
+                        experience_candidates.append(candidate)
+                        continue
                     if cb:
                         cb(chunk)
                     if chunk.get("type") in {"content_chunk", "message", "tool_result"}:
@@ -319,6 +350,7 @@ worker_key 只能是:
                 state["run_id"],
                 {
                     "status": "step_completed",
+                    "thread_id": state.get("thread_id", ""),
                     "current_step": idx + 1,
                     "total_steps": len(plan),
                     "worker": worker.name,
@@ -335,6 +367,7 @@ worker_key 只能是:
                 "plan": plan,
                 "execution_context": new_context,
                 "step_results": step_results,
+                "experience_candidates": experience_candidates,
                 "current_step_idx": idx + 1,
                 "messages": [AIMessage(content=f"⚙️ [{worker.name} 步骤 {idx + 1} 完成]")],
             }
@@ -352,7 +385,24 @@ worker_key 只能是:
         final_answer = "✅ 多 Agent Leader-Worker 执行完成。"
         if lines:
             final_answer += "\n" + "\n".join(lines)
-        redis_state.set_run_status(state["run_id"], {"status": "completed", "results": results})
+        memory_result = self.experience_policy.consolidate_success(
+            user_input=state["messages"][0].content,
+            final_answer=final_answer,
+            step_results=results,
+            candidates=state.get("experience_candidates") or [],
+            run_id=state["run_id"],
+            thread_id=state.get("thread_id", ""),
+        )
+        redis_state.set_run_status(
+            state["run_id"],
+            {
+                "status": "completed",
+                "thread_id": state.get("thread_id", ""),
+                "results": results,
+                "memory": memory_result,
+                "memory_lookup": {k: v for k, v in (state.get("memory_lookup") or {}).items() if k != "sop"},
+            },
+        )
         self._emit_status(cb, "📝 正在收尾并返回结果...")
         return {
             "final_answer": final_answer,
@@ -370,9 +420,10 @@ worker_key 只能是:
             return "general"
         return worker_key
 
-    def run_stream(self, user_input: str, callback: callable = None, run_id: str = ""):
+    def run_stream(self, user_input: str, callback: callable = None, run_id: str = "", thread_id: str = ""):
         run_id = run_id or f"run-{uuid.uuid4().hex[:12]}"
-        redis_state.set_run_status(run_id, {"status": "received", "input": user_input[:500]})
+        thread_id = thread_id or run_id
+        redis_state.set_run_status(run_id, {"status": "received", "thread_id": thread_id, "input": user_input[:500]})
         logger.info(">>> LangGraph Leader-Worker Orchestration Triggered <<<")
         initial_state = {
             "messages": [HumanMessage(content=user_input)],
@@ -380,10 +431,14 @@ worker_key 只能是:
             "current_step_idx": 0,
             "execution_context": "",
             "step_results": [],
+            "experience_candidates": [],
             "final_answer": "",
             "run_id": run_id,
+            "thread_id": thread_id,
+            "memory_sop": "",
+            "memory_lookup": {},
         }
-        config: RunnableConfig = {"configurable": {"callback": callback}}
+        config: RunnableConfig = {"configurable": {"callback": callback, "thread_id": thread_id}}
 
         for _event in self.graph.stream(initial_state, config=config, stream_mode="updates"):
             # All user-facing stream chunks already go through callback from nodes.

@@ -34,9 +34,12 @@ from redis_state import redis_state
 from models import (
     create_chat_session,
     get_chat_messages,
+    get_chat_messages_after,
+    get_chat_memory_state,
     get_chat_session,
     insert_chat_message,
     list_chat_sessions,
+    update_chat_memory_state,
 )
 
 # 日志输出配置
@@ -723,21 +726,102 @@ class ChatSessionCreateReq(BaseModel):
     title: str = "新对话"
 
 
-def _build_agent_input(content: str, history: List[Dict[str, Any]]) -> str:
-    if not history:
+SHORT_MEMORY_RECENT_MESSAGES = 8
+SHORT_MEMORY_SUMMARY_TRIGGER_MESSAGES = 12
+SHORT_MEMORY_KEEP_RECENT_MESSAGES = 6
+SHORT_MEMORY_MAX_CHARS = 1800
+
+
+def _clip_text(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _format_chat_messages(messages: List[Dict[str, Any]], max_chars: int = 1200) -> List[str]:
+    lines = []
+    for item in messages:
+        role = "用户" if item.get("role") == "user" else "AI"
+        text = _clip_text(item.get("content") or "", max_chars)
+        if text:
+            lines.append(f"{role}: {text}")
+    return lines
+
+
+def _fallback_summary(existing_summary: str, messages: List[Dict[str, Any]]) -> str:
+    lines = []
+    if existing_summary:
+        lines.append("既有摘要:")
+        lines.append(_clip_text(existing_summary, 900))
+    lines.append("新增要点:")
+    lines.extend(_format_chat_messages(messages, max_chars=300))
+    return _clip_text("\n".join(lines), SHORT_MEMORY_MAX_CHARS)
+
+
+def _summarize_short_memory(existing_summary: str, messages: List[Dict[str, Any]]) -> str:
+    if not messages:
+        return existing_summary or ""
+
+    transcript = "\n".join(_format_chat_messages(messages, max_chars=900))
+    prompt = f"""
+请把下面会话内容滚动更新为短期记忆摘要，用于下一轮 Agent 继续理解上下文。
+要求：
+- 保留用户目标、关键约束、已经完成/失败的操作、重要任务 ID/脚本路径/cron 规则。
+- 删除寒暄、重复内容和冗余工具输出。
+- 不要编造不存在的信息。
+- 输出 6 条以内中文要点，最多 600 字。
+
+已有摘要：
+{existing_summary or "无"}
+
+新增会话：
+{transcript}
+""".strip()
+    try:
+        from exquisite_agent.llm import LLM
+
+        resp = LLM().chat([{"role": "user", "content": prompt}], [])
+        summary = getattr(resp, "content", "") or ""
+        return _clip_text(summary, SHORT_MEMORY_MAX_CHARS) or _fallback_summary(existing_summary, messages)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("短期记忆摘要生成失败，使用截断兜底: %s", exc)
+        return _fallback_summary(existing_summary, messages)
+
+
+def _maybe_update_short_memory(session_id: str):
+    state = get_chat_memory_state(session_id)
+    messages = get_chat_messages_after(session_id, after_seq=state.get("summarized_seq", 0), limit=200)
+    if len(messages) < SHORT_MEMORY_SUMMARY_TRIGGER_MESSAGES:
+        return
+
+    to_summarize = messages[:-SHORT_MEMORY_KEEP_RECENT_MESSAGES]
+    if not to_summarize:
+        return
+
+    summary = _summarize_short_memory(state.get("short_summary", ""), to_summarize)
+    summarized_seq = int(to_summarize[-1].get("seq") or state.get("summarized_seq", 0) or 0)
+    update_chat_memory_state(session_id, summary, summarized_seq)
+
+
+def _build_agent_input(content: str, history: List[Dict[str, Any]], short_summary: str = "") -> str:
+    if not history and not short_summary:
         return content
 
-    lines = ["以下是当前会话最近上下文，请结合上下文继续完成用户最新请求。"]
-    for item in history[-8:]:
-        role = "用户" if item.get("role") == "user" else "AI"
-        text = (item.get("content") or "").strip()
-        if not text:
-            continue
-        if len(text) > 1200:
-            text = text[:1200].rstrip() + "..."
-        lines.append(f"{role}: {text}")
+    lines = ["以下是当前会话上下文，请结合上下文继续完成用户最新请求。"]
+    if short_summary:
+        lines.append("[较早上下文摘要]")
+        lines.append(_clip_text(short_summary, SHORT_MEMORY_MAX_CHARS))
+    recent_lines = _format_chat_messages(history[-SHORT_MEMORY_RECENT_MESSAGES:])
+    if recent_lines:
+        lines.append("[最近消息]")
+        lines.extend(recent_lines)
     lines.append(f"用户最新请求: {content}")
     return "\n\n".join(lines)
+
+
+def _chat_thread_id(session_id: str) -> str:
+    return f"chat:{session_id}"
 
 
 @app.get("/api/chat/sessions")
@@ -782,6 +866,18 @@ async def get_agent_run_status(run_id: str):
         "status": status,
     }
 
+
+@app.get("/api/agent/threads/{session_id}")
+async def get_agent_thread_status(session_id: str):
+    thread_id = _chat_thread_id(session_id)
+    status = redis_state.get_thread_state(thread_id)
+    return {
+        "session_id": session_id,
+        "thread_id": thread_id,
+        "redis_enabled": redis_state.enabled,
+        "status": status,
+    }
+
 @app.websocket("/ws/chat")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -806,29 +902,85 @@ async def websocket_endpoint(websocket: WebSocket):
             if not session_id or not get_chat_session(session_id):
                 session = create_chat_session()
                 session_id = session["session_id"]
+            thread_id = _chat_thread_id(session_id)
 
             logging.info(f"UI 用户发送了: {user_msg}")
 
             q = queue.Queue()
             run_id = f"run-{uuid.uuid4().hex[:12]}"
             insert_chat_message(session_id, "user", user_msg, run_id=run_id)
-            history = get_chat_messages(session_id, limit=9)
-            agent_input = _build_agent_input(user_msg, history[:-1])
+            memory_state = get_chat_memory_state(session_id)
+            recent_limit = SHORT_MEMORY_RECENT_MESSAGES + 1
+            summarized_seq = int(memory_state.get("summarized_seq", 0) or 0)
+            history = [
+                item for item in get_chat_messages(session_id, limit=recent_limit)
+                if int(item.get("seq") or 0) > summarized_seq
+            ]
+            agent_input = _build_agent_input(user_msg, history[:-1], memory_state.get("short_summary", ""))
+            redis_state.set_thread_state(
+                thread_id,
+                {
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "status": "queued",
+                    "history_messages": len(history),
+                    "summary_chars": len(memory_state.get("short_summary", "")),
+                },
+            )
 
-            def sync_worker(msg, q_out, rid):
+            def sync_worker(msg, q_out, rid, tid, sid):
                 try:
-                    # 使用 LangGraph 编排器运行流，并传入回调函数实时推送工具消息
-                    for chunk in orchestrator.run_stream(msg, callback=lambda c: q_out.put(c), run_id=rid):
-                        q_out.put(chunk)
+                    with redis_state.lock(f"thread:{tid}", ttl=900, wait_timeout=0.1) as locked:
+                        redis_state.set_thread_state(
+                            tid,
+                            {
+                                "session_id": sid,
+                                "run_id": rid,
+                                "status": "running",
+                                "locked": bool(locked),
+                            },
+                        )
+                        # 使用 LangGraph 编排器运行流，并传入回调函数实时推送工具消息
+                        for chunk in orchestrator.run_stream(msg, callback=lambda c: q_out.put(c), run_id=rid, thread_id=tid):
+                            q_out.put(chunk)
+                        redis_state.set_thread_state(
+                            tid,
+                            {
+                                "session_id": sid,
+                                "run_id": rid,
+                                "status": "completed",
+                                "locked": bool(locked),
+                            },
+                        )
+                    q_out.put(None)
+                except TimeoutError:
+                    q_out.put({"type": "message", "content": "\n\n当前会话已有 Agent 正在执行，请等待上一次回复结束后再继续。"})
+                    redis_state.set_thread_state(
+                        tid,
+                        {
+                            "session_id": sid,
+                            "run_id": rid,
+                            "status": "busy",
+                        },
+                    )
                     q_out.put(None)
                 except Exception as e:
                     q_out.put({"type": "message", "content": f"\n\n[核心异常]: {str(e)}"})
+                    redis_state.set_thread_state(
+                        tid,
+                        {
+                            "session_id": sid,
+                            "run_id": rid,
+                            "status": "failed",
+                            "error": str(e),
+                        },
+                    )
                     q_out.put(None)
 
-            thread = threading.Thread(target=sync_worker, args=(agent_input, q, run_id))
+            thread = threading.Thread(target=sync_worker, args=(agent_input, q, run_id, thread_id, session_id))
             thread.start()
 
-            await websocket.send_json({"type": "stream_start", "run_id": run_id, "session_id": session_id})
+            await websocket.send_json({"type": "stream_start", "run_id": run_id, "session_id": session_id, "thread_id": thread_id})
             last_heartbeat_ts = asyncio.get_running_loop().time()
             agent_reply_parts: List[str] = []
 
@@ -858,7 +1010,8 @@ async def websocket_endpoint(websocket: WebSocket):
             agent_reply = "".join(agent_reply_parts).strip()
             if agent_reply:
                 insert_chat_message(session_id, "agent", agent_reply, run_id=run_id)
-            await websocket.send_json({"type": "stream_end", "session_id": session_id})
+            await asyncio.to_thread(_maybe_update_short_memory, session_id)
+            await websocket.send_json({"type": "stream_end", "session_id": session_id, "thread_id": thread_id})
             await broadcast_refresh_jobs()
 
     except WebSocketDisconnect:

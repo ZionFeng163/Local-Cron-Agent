@@ -123,6 +123,9 @@ def init_db():
             created_at TEXT DEFAULT '',
             updated_at TEXT DEFAULT '',
             last_message_at TEXT DEFAULT '',
+            short_summary TEXT DEFAULT '',
+            summarized_seq INTEGER DEFAULT 0,
+            summary_updated_at TEXT DEFAULT '',
             archived INTEGER DEFAULT 0
         )
     """)
@@ -140,6 +143,16 @@ def init_db():
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated ON chat_sessions(updated_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_session_seq ON chat_messages(session_id, seq)")
+
+    chat_session_cols = {row["name"] for row in conn.execute("PRAGMA table_info(chat_sessions)").fetchall()}
+    chat_session_alters = {
+        "short_summary": "ALTER TABLE chat_sessions ADD COLUMN short_summary TEXT DEFAULT ''",
+        "summarized_seq": "ALTER TABLE chat_sessions ADD COLUMN summarized_seq INTEGER DEFAULT 0",
+        "summary_updated_at": "ALTER TABLE chat_sessions ADD COLUMN summary_updated_at TEXT DEFAULT ''",
+    }
+    for col, sql in chat_session_alters.items():
+        if col not in chat_session_cols:
+            conn.execute(sql)
 
     conn.commit()
     conn.close()
@@ -512,6 +525,73 @@ def get_chat_messages(session_id: str, limit: int = 200) -> List[Dict[str, Any]]
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_chat_messages_after(session_id: str, after_seq: int = 0, limit: int = 200) -> List[Dict[str, Any]]:
+    safe_limit = max(1, min(limit, 500))
+    conn = _connect()
+    rows = conn.execute(
+        """
+        SELECT message_id, session_id, role, content, created_at, run_id, seq
+        FROM chat_messages
+        WHERE session_id = ? AND seq > ?
+        ORDER BY seq ASC
+        LIMIT ?
+        """,
+        (session_id, max(0, int(after_seq or 0)), safe_limit)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_chat_memory_state(session_id: str) -> Dict[str, Any]:
+    conn = _connect()
+    row = conn.execute(
+        """
+        SELECT short_summary, summarized_seq, summary_updated_at
+        FROM chat_sessions
+        WHERE session_id = ? AND archived = 0
+        """,
+        (session_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"short_summary": "", "summarized_seq": 0, "summary_updated_at": ""}
+    return {
+        "short_summary": row["short_summary"] or "",
+        "summarized_seq": int(row["summarized_seq"] or 0),
+        "summary_updated_at": row["summary_updated_at"] or "",
+    }
+
+
+def update_chat_memory_state(session_id: str, short_summary: str, summarized_seq: int) -> Dict[str, Any]:
+    now = _now()
+    conn = _connect()
+    conn.execute(
+        """
+        UPDATE chat_sessions
+        SET short_summary = ?, summarized_seq = ?, summary_updated_at = ?, updated_at = ?
+        WHERE session_id = ? AND archived = 0
+        """,
+        (short_summary or "", max(0, int(summarized_seq or 0)), now, now, session_id)
+    )
+    conn.commit()
+    row = conn.execute(
+        """
+        SELECT short_summary, summarized_seq, summary_updated_at
+        FROM chat_sessions
+        WHERE session_id = ? AND archived = 0
+        """,
+        (session_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"short_summary": "", "summarized_seq": 0, "summary_updated_at": ""}
+    return {
+        "short_summary": row["short_summary"] or "",
+        "summarized_seq": int(row["summarized_seq"] or 0),
+        "summary_updated_at": row["summary_updated_at"] or "",
+    }
 
 
 def insert_chat_message(session_id: str, role: str, content: str, run_id: str = "") -> Dict[str, Any]:

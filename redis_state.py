@@ -82,5 +82,24 @@ class RedisStateCoordinator:
         except json.JSONDecodeError:
             return None
 
+    def set_thread_state(self, thread_id: str, payload: Dict[str, Any], ttl: int = 86400):
+        if not self.enabled or not self.client:
+            return
+        data = dict(payload)
+        data["thread_id"] = thread_id
+        data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.client.setex(self._key(f"thread:{thread_id}"), ttl, json.dumps(data, ensure_ascii=False))
+
+    def get_thread_state(self, thread_id: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled or not self.client:
+            return None
+        raw = self.client.get(self._key(f"thread:{thread_id}"))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
 
 redis_state = RedisStateCoordinator()
